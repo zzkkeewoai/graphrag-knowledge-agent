@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+venv/
+env/
+.venv
+
+# 密钥与环境（绝不入库）
+.env
+.env.local
+*.key
+*.pem
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# 测试缓存
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 运行数据（可重新生成）
+neo4j_data/
+neo4j_logs/
+etcd_data/
+minio_data/
+data/*.json

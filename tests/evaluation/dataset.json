@@ -1,0 +1,227 @@
+{
+  "_comment": "RAG Evaluation Dataset（v2.2）— 每 case 的 knowledge 是注入假客户端的固定知识库（graph_edges + texts），expected_* 是系统应表现的行为。走真实生产路径（Router→Retrieval→RRF→Rerank→EvidenceValidator→ConflictResolver→Answer/Refuse），不依赖外部 LLM（use_llm=False 模板模式）。",
+  "cases": [
+    {
+      "id": "fact_001",
+      "category": "normal_fact",
+      "query": "智能客服系统采用了哪些技术？",
+      "expected_behavior": "answer",
+      "expected_evidence": "sufficient",
+      "expected_entities": ["智能客服系统"],
+      "expected_targets": ["Java 17", "FastAPI"],
+      "knowledge": {
+        "graph_edges": [
+          {"entity": "智能客服系统", "relation": "使用", "target": "Java 17", "confidence": 0.95},
+          {"entity": "智能客服系统", "relation": "使用", "target": "FastAPI", "confidence": 0.95}
+        ],
+        "texts": [
+          {"text": "智能客服系统采用了Java 17和FastAPI框架，部署在K8s集群。", "doc_id": "doc_fact_001"}
+        ]
+      }
+    },
+    {
+      "id": "relation_001",
+      "category": "relation_single_hop",
+      "query": "张三负责哪些项目？",
+      "expected_behavior": "answer",
+      "expected_evidence": "sufficient",
+      "expected_relation": "负责",
+      "expected_entities": ["张三"],
+      "expected_targets": ["项目B"],
+      "knowledge": {
+        "graph_edges": [
+          {"entity": "张三", "relation": "负责", "target": "项目B", "confidence": 0.95}
+        ],
+        "texts": []
+      }
+    },
+    {
+      "id": "relation_002",
+      "category": "relation_single_hop_multi",
+      "query": "李婷负责哪些项目？",
+      "expected_behavior": "answer",
+      "expected_evidence": "sufficient",
+      "expected_relation": "负责",
+      "expected_entities": ["李婷"],
+      "expected_targets": ["项目C"],
+      "knowledge": {
+        "graph_edges": [
+          {"entity": "李婷", "relation": "负责", "target": "项目C", "confidence": 0.9},
+          {"entity": "李婷", "relation": "参与", "target": "项目A", "confidence": 0.9}
+        ],
+        "texts": []
+      }
+    },
+    {
+      "id": "multi_hop_001",
+      "category": "relation_multi_hop",
+      "query": "B项目依赖的项目使用了哪些技术？",
+      "expected_behavior": "answer",
+      "expected_evidence": "sufficient",
+      "expected_entities": ["B项目"],
+      "expected_targets": ["gRPC"],
+      "knowledge": {
+        "graph_edges": [
+          {"entity": "B项目", "relation": "依赖", "target": "C项目", "confidence": 0.9},
+          {"entity": "C项目", "relation": "使用", "target": "gRPC", "confidence": 0.9}
+        ],
+        "texts": [
+          {"text": "C项目采用gRPC通信协议，是微服务基础设施。", "doc_id": "doc_hop_001"}
+        ]
+      }
+    },
+    {
+      "id": "both_001",
+      "category": "graph_and_vector",
+      "query": "智能客服系统依赖哪个项目？",
+      "expected_behavior": "answer",
+      "expected_evidence": "sufficient",
+      "expected_entities": ["智能客服系统"],
+      "expected_targets": ["B项目"],
+      "knowledge": {
+        "graph_edges": [
+          {"entity": "智能客服系统", "relation": "依赖", "target": "B项目", "confidence": 0.92}
+        ],
+        "texts": [
+          {"text": "智能客服系统依赖B项目提供的用户权限管理模块。", "doc_id": "doc_both_001"}
+        ]
+      }
+    },
+    {
+      "id": "vector_insufficient_001",
+      "category": "vector_relevant_but_insufficient",
+      "query": "张三负责哪些项目？",
+      "expected_behavior": "refuse",
+      "expected_evidence": "insufficient",
+      "expected_relation": "负责",
+      "expected_entities": ["张三"],
+      "expected_targets": [],
+      "knowledge": {
+        "graph_edges": [],
+        "texts": [
+          {"text": "张三参与了项目A的开发工作，负责部分模块的编码。", "doc_id": "doc_vec_insuf_001"}
+        ]
+      }
+    },
+    {
+      "id": "graph_only_001",
+      "category": "graph_only",
+      "query": "智能客服系统用什么数据库？",
+      "expected_behavior": "answer",
+      "expected_evidence": "sufficient",
+      "expected_entities": ["智能客服系统"],
+      "expected_targets": ["Milvus"],
+      "knowledge": {
+        "graph_edges": [
+          {"entity": "智能客服系统", "relation": "使用", "target": "Milvus", "confidence": 0.95}
+        ],
+        "texts": []
+      }
+    },
+    {
+      "id": "insufficient_refuse_001",
+      "category": "insufficient_refuse",
+      "query": "张三负责哪些项目？",
+      "expected_behavior": "refuse",
+      "expected_evidence": "insufficient",
+      "expected_relation": "负责",
+      "expected_entities": ["张三"],
+      "expected_targets": [],
+      "knowledge": {
+        "graph_edges": [
+          {"entity": "张三", "relation": "参与", "target": "项目A", "confidence": 0.9}
+        ],
+        "texts": [
+          {"text": "张三参与了项目A的开发工作。", "doc_id": "doc_insuf_ref_001"}
+        ]
+      }
+    },
+    {
+      "id": "conflict_resolved_001",
+      "category": "conflict_resolved",
+      "query": "张三现在负责项目A吗？",
+      "expected_behavior": "answer",
+      "expected_evidence": "conflict",
+      "expected_relation": "负责",
+      "expected_entities": ["张三"],
+      "expected_targets": [],
+      "expected_resolution": "oppose",
+      "knowledge": {
+        "graph_edges": [
+          {"entity": "张三", "relation": "负责", "target": "项目A", "confidence": 0.95}
+        ],
+        "texts": [
+          {"text": "张三已经不再负责项目A，目前由李四负责，已于2025年交接完成。", "doc_id": "doc_conf_001", "timestamp": "2025-06-01"}
+        ]
+      }
+    },
+    {
+      "id": "conflict_unresolved_001",
+      "category": "conflict_unresolved",
+      "query": "张三负责项目B吗？",
+      "expected_behavior": "refuse",
+      "expected_evidence": "conflict",
+      "expected_relation": "负责",
+      "expected_entities": ["张三"],
+      "expected_targets": [],
+      "expected_resolution": "unresolved",
+      "knowledge": {
+        "graph_edges": [
+          {"entity": "张三", "relation": "负责", "target": "项目B", "confidence": 0.95}
+        ],
+        "texts": [
+          {"text": "张三不负责项目B。", "doc_id": "doc_conf_unres_001"}
+        ]
+      }
+    },
+    {
+      "id": "not_in_kb_001",
+      "category": "not_in_knowledge_base",
+      "query": "王五负责哪些项目？",
+      "expected_behavior": "refuse",
+      "expected_evidence": "insufficient",
+      "expected_entities": [],
+      "expected_targets": [],
+      "knowledge": {
+        "graph_edges": [],
+        "texts": []
+      }
+    },
+    {
+      "id": "semantic_trap_001",
+      "category": "semantic_trap_relation",
+      "query": "张三负责项目A吗？",
+      "expected_behavior": "refuse",
+      "expected_evidence": "insufficient",
+      "expected_relation": "负责",
+      "expected_entities": ["张三"],
+      "expected_targets": [],
+      "knowledge": {
+        "graph_edges": [
+          {"entity": "张三", "relation": "参与", "target": "项目A", "confidence": 0.9}
+        ],
+        "texts": [
+          {"text": "张三参与了项目A的启动工作。", "doc_id": "doc_trap_001"}
+        ]
+      }
+    },
+    {
+      "id": "participate_not_conflict_001",
+      "category": "participate_plus_vector_support",
+      "query": "张三负责项目A吗？",
+      "expected_behavior": "answer",
+      "expected_evidence": "sufficient",
+      "expected_relation": "负责",
+      "expected_entities": ["张三"],
+      "expected_targets": ["项目A"],
+      "knowledge": {
+        "graph_edges": [
+          {"entity": "张三", "relation": "参与", "target": "项目A", "confidence": 0.9}
+        ],
+        "texts": [
+          {"text": "张三负责项目A的开发和上线，是项目负责人。", "doc_id": "doc_part_sup_001"}
+        ]
+      }
+    }
+  ]
+}

@@ -25,7 +25,8 @@ class SemanticCache:
         encoder=None,               # SentenceTransformer 编码器（复用）
         similarity_threshold: float = 0.92,
         ttl: int = 3600,            # 缓存过期时间（秒）
-        max_size: int = 1000        # 最大缓存条目
+        max_size: int = 1000,       # 最大缓存条目
+        knowledge_version: str = "1"  # v2.2: 知识库版本，知识更新时 bump → 旧缓存失效
     ):
         if encoder is None:
             from sentence_transformers import SentenceTransformer
@@ -34,12 +35,13 @@ class SemanticCache:
         self.similarity_threshold = similarity_threshold
         self.ttl = ttl
         self.max_size = max_size
+        self.knowledge_version = str(knowledge_version)
 
-        # L1: 精确缓存 {md5_hash: (result, timestamp)}
-        self.exact_cache: Dict[str, Tuple[Any, float]] = {}
+        # L1: 精确缓存 {md5_hash: (result, timestamp, knowledge_version)}
+        self.exact_cache: Dict[str, Tuple[Any, float, str]] = {}
 
-        # L2: 语义缓存 {md5_hash: (query_text, embedding, result, timestamp)}
-        self.semantic_cache: Dict[str, Tuple[str, np.ndarray, Any, float]] = {}
+        # L2: 语义缓存 {md5_hash: (query_text, embedding, result, timestamp, knowledge_version)}
+        self.semantic_cache: Dict[str, Tuple[str, np.ndarray, Any, float, str]] = {}
 
         self.hit_count = 0
         self.miss_count = 0
@@ -49,6 +51,10 @@ class SemanticCache:
 
     def _is_expired(self, timestamp: float) -> bool:
         return (time.time() - timestamp) > self.ttl
+
+    def _is_stale_version(self, version) -> bool:
+        """v2.2: 缓存条目的知识库版本与当前版本不一致 = 旧数据（知识已更新）"""
+        return str(version) != self.knowledge_version
 
     def _evict_if_full(self):
         """缓存满了，移出最旧的条目"""
@@ -71,12 +77,16 @@ class SemanticCache:
         """
         查询缓存：L1 精确 → L2 语义
         返回: 缓存结果或 None
+        v2.2: 命中还需校验 knowledge_version —— 知识更新后旧缓存视为 miss
         """
         # L1: 精确匹配
         query_hash = self._hash(query)
         if query_hash in self.exact_cache:
-            result, timestamp = self.exact_cache[query_hash]
-            if not self._is_expired(timestamp):
+            result, timestamp, version = self.exact_cache[query_hash]
+            if self._is_stale_version(version):
+                # 知识已更新，旧缓存作废
+                del self.exact_cache[query_hash]
+            elif not self._is_expired(timestamp):
                 self.hit_count += 1
                 logger.debug(f"L1 精确缓存命中: {query[:50]}...")
                 return result
@@ -91,9 +101,9 @@ class SemanticCache:
             best_key = None
             best_result = None
 
-            for key, (cached_query, cached_emb, result, timestamp) in self.semantic_cache.items():
-                if self._is_expired(timestamp):
-                    continue
+            for key, (cached_query, cached_emb, result, timestamp, version) in self.semantic_cache.items():
+                if self._is_expired(timestamp) or self._is_stale_version(version):
+                    continue   # 过期或版本过旧，跳过
                 sim = float(np.dot(query_emb, cached_emb))  # 余弦相似度
                 if sim > best_similarity:
                     best_similarity = sim
@@ -111,18 +121,18 @@ class SemanticCache:
         return None
 
     def set(self, query: str, result: Any):
-        """写入缓存"""
+        """写入缓存（v2.2: 记录当前 knowledge_version）"""
         query_hash = self._hash(query)
         now = time.time()
 
         # L1: 精确缓存
-        self.exact_cache[query_hash] = (result, now)
+        self.exact_cache[query_hash] = (result, now, self.knowledge_version)
 
         # L2: 语义缓存
         try:
             query_emb = self.encoder.encode([query], normalize_embeddings=True)[0]
             self._evict_if_full()
-            self.semantic_cache[query_hash] = (query, query_emb, result, now)
+            self.semantic_cache[query_hash] = (query, query_emb, result, now, self.knowledge_version)
         except Exception as e:
             logger.warning(f"语义缓存写入异常: {e}")
 
@@ -149,5 +159,6 @@ class SemanticCache:
             "miss_count": self.miss_count,
             "hit_rate": f"{self.hit_rate:.2%}",
             "similarity_threshold": self.similarity_threshold,
-            "ttl": self.ttl
+            "ttl": self.ttl,
+            "knowledge_version": self.knowledge_version,
         }

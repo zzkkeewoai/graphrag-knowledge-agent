@@ -23,6 +23,8 @@ from src.retriever.hybrid_retriever import HybridRetriever
 from src.reranker.reranker import BGEReranker
 from src.utils.semantic_cache import SemanticCache
 from src.utils.tracing import tracer
+from src.agents.evidence_validator import EvidenceValidator, extract_target_relation, extract_target_entity
+from src.agents.conflict_resolver import ConflictResolver
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +56,26 @@ class AgentState(TypedDict):
 
     # 降级标记：local 检索全部失败 → 条件边切换到 global 分析（v2.1 新增）
     fallback_to_global: NotRequired[bool]
+
+    # 证据验证（v2.2 新增）
+    # 用户问题的目标关系类型（如"负责"），由 EvidenceValidator 从 query 提取
+    target_relation: NotRequired[str]
+    # 目标实体（如"张三"），供 targeted graph retrieval 使用
+    target_entity: NotRequired[str]
+    # 证据状态：sufficient / insufficient / conflict / unknown
+    evidence_status: NotRequired[str]
+    # EvidenceValidator 决定的下一步：answer / targeted_graph / refuse / conflict
+    next_action: NotRequired[str]
+    # 是否已做过一次 targeted graph retrieval（避免无限循环）
+    targeted_retried: NotRequired[bool]
+    # 冲突检测状态：none / detected / resolved / unresolved（v2.2 Conflict Resolver）
+    conflict_status: NotRequired[str]
+    # 证据明细（供 answer_node 使用 / 日志）
+    evidence_detail: NotRequired[List[Dict]]
+    # 冲突双方证据（EvidenceValidator 收集，供 ConflictResolver 裁决）
+    conflict_evidence: NotRequired[List[Dict]]
+    # 冲突裁决结果说明（resolved 时记录裁决理由）
+    conflict_resolution: NotRequired[str]
 
     # 执行控制
     step_count: int                               # 当前步数，防死循环
@@ -199,6 +221,10 @@ class LocalRetrievalAgent:
             "type": "local",
             "query": query,
             "documents": reranked,
+            # v2.2 Evaluation 修复：返回结构化图谱证据供 EvidenceValidator 使用
+            # （否则证据验证只能靠 documents 文本，relation 结构化匹配会退化）
+            "graph_results": results.get('graph_results', []),
+            "vector_results": results.get('vector_results', []),
             "graph_count": len(results.get('graph_results', [])),
             "vector_count": len(results.get('vector_results', [])),
         }
@@ -378,8 +404,19 @@ def create_orchestrator_graph(
     global_agent = GlobalAnalysisAgent(neo4j_client)
     answer_agent = AnswerAgent(use_llm=use_llm)
 
-    # 语义缓存
-    cache = SemanticCache(encoder=reranker.model) if use_cache else None
+    # 语义缓存（v2.2: threshold/max_size/knowledge_version 配置化）
+    cache = SemanticCache(
+        encoder=reranker.model,
+        similarity_threshold=Config.CACHE_SIMILARITY_THRESHOLD,
+        ttl=Config.CACHE_TTL,
+        max_size=Config.CACHE_MAX_SIZE,
+        knowledge_version=Config.KNOWLEDGE_VERSION,
+    ) if use_cache else None
+
+    # 证据验证器（v2.2 新增，确定性规则，不调 LLM）
+    evidence_validator = EvidenceValidator()
+    # 冲突解决器（v2.2 新增，确定性规则：时间→来源→置信度）
+    conflict_resolver = ConflictResolver()
 
     # ============================================================
     # 节点函数
@@ -452,6 +489,158 @@ def create_orchestrator_graph(
         state["fallback_to_global"] = True
         return state
 
+    def evidence_validator_node(state: AgentState) -> AgentState:
+        """证据验证节点（v2.2 新增）
+
+        判断检索到的证据是否足以支持用户问题：
+          - sufficient → answer（进 AnswerAgent）
+          - insufficient（首次）→ targeted_graph（定向图谱补充召回）
+          - insufficient（已重试）→ refuse（拒答，不交给 LLM 自由发挥）
+          - conflict → conflict（进入冲突处理分支，v2.2 预留）
+        """
+        query = state["query"]
+        known_entities = [r.get("entity", "") for r in (state.get("graph_results") or [])]
+
+        with tracer.start_span("evidence_validation", query=query[:50]) as span:
+            result = evidence_validator.validate(
+                query=query,
+                graph_results=state.get("graph_results", []),
+                documents=state.get("documents", []),
+                targeted_retried=bool(state.get("targeted_retried")),
+                known_entities=known_entities,
+            )
+            span.set_attribute("evidence_status", result["evidence_status"])
+            span.set_attribute("next_action", result["next_action"])
+
+            state["evidence_status"] = result["evidence_status"]
+            state["next_action"] = result["next_action"]
+            state["conflict_status"] = result.get("conflict_status", "unknown")
+            state["target_relation"] = result.get("target_relation")
+            state["target_entity"] = result.get("target_entity")
+            state["evidence_detail"] = result.get("evidence_detail", [])
+            # 修复：conflict 分支必须把正反证据写入 state，供 ConflictResolver 裁决
+            state["conflict_evidence"] = result.get("conflict_evidence", [])
+
+        logger.info(f"[Evidence] status={state['evidence_status']} action={state['next_action']}")
+        return state
+
+    def targeted_graph_node(state: AgentState) -> AgentState:
+        """定向图谱检索节点（v2.2 新增）
+
+        当 Evidence Validator 判定 insufficient 时触发：
+        针对 query 中的 entity + 期望 relation_type 做精确结构化查询，
+        补充"正向证据"，然后回到 evidence_validator_node 二次判断。
+        """
+        query = state["query"]
+        entity = state.get("target_entity") or extract_target_entity(query, [])
+        rel = state.get("target_relation") or extract_target_relation(query)
+
+        with tracer.start_span("targeted_graph_retrieval", query=query[:50]) as span:
+            span.set_attribute("entity", entity or "")
+            span.set_attribute("relation", rel or "")
+
+            if entity and rel:
+                targeted = neo4j_client.query_entity_by_relation(entity, rel)
+                span.set_attribute("targeted_count", len(targeted))
+            else:
+                targeted = []
+
+            # 与已有 graph_results 合并（避免重复），统一格式
+            seen = set()
+            merged = list(state.get("graph_results") or [])
+            for item in state.get("graph_results") or []:
+                seen.add((item.get("entity"), item.get("relation"), item.get("target")))
+
+            for t in targeted:
+                key = (t.get("entity"), t.get("relation"), t.get("target"))
+                if key not in seen:
+                    seen.add(key)
+                    merged.append({
+                        "doc_id": f"graph:{t.get('entity', '')}",
+                        "chunk_index": len(merged),
+                        "text": f"{t.get('entity')} {t.get('relation')} {t.get('target')}",
+                        "entity": t.get("entity", ""),
+                        "relation": t.get("relation", ""),
+                        "target": t.get("target", ""),
+                        "confidence": t.get("confidence", 0.5),
+                        "source": "neo4j",
+                        "hop": 1,
+                    })
+
+            state["graph_results"] = merged
+            state["targeted_retried"] = True
+            state["step_count"] += 1
+
+        return state
+
+    def refuse_node(state: AgentState) -> AgentState:
+        """拒答节点（v2.2 新增）
+
+        证据不足（含 targeted 补充后仍不足）时拒答，
+        不让 LLM 基于不充分证据自由发挥/推断。
+        """
+        entity = state.get("target_entity") or ""
+        rel = state.get("target_relation") or ""
+        if entity and rel:
+            state["answer"] = f"当前知识库中的信息不足以确认{entity}{rel}的结论。"
+        else:
+            state["answer"] = "当前知识库中的信息不足以回答您的问题。"
+        state["evidence_status"] = "insufficient"
+        logger.info(f"[Refuse] 证据不足，拒答: {state['answer']}")
+        return state
+
+    def conflict_node(state: AgentState) -> AgentState:
+        """冲突处理节点（v2.2 Conflict Resolver 接入）
+
+        EvidenceValidator 检测到冲突（支持 vs 反对证据并存）后进入本节点：
+          - ConflictResolver 用确定性规则裁决（时间 → 来源 → 置信度）
+          - resolved → 设置 winner 答案（模板化，不调 LLM），走 answer
+          - unresolved → 拒答，说明冲突存在
+        """
+        entity = state.get("target_entity") or ""
+        rel = state.get("target_relation") or ""
+        conflict_evidence = state.get("conflict_evidence") or []
+        evidence_detail = state.get("evidence_detail") or []
+
+        with tracer.start_span("conflict_resolution", query=(state.get("query") or "")[:50]) as span:
+            result = conflict_resolver.resolve(
+                query=state.get("query", ""),
+                conflict_evidence=conflict_evidence,
+                evidence_detail=evidence_detail,
+            )
+            span.set_attribute("conflict_status", result["conflict_status"])
+            span.set_attribute("next_action", result["next_action"])
+
+            state["conflict_status"] = result["conflict_status"]
+            state["next_action"] = result["next_action"]
+            state["conflict_resolution"] = result.get("conflict_resolution", "")
+
+        if result["next_action"] == "refuse":
+            # unresolved → 拒答（明确说明存在冲突，不编造答案）
+            state["answer"] = (
+                f"知识库中存在关于{entity}是否{rel}的冲突信息，"
+                f"当前无法可靠确认。建议核实最新状态后再确认。"
+            )
+            logger.info(f"[Conflict] unresolved，拒答: {state['answer']}")
+            return state
+
+        # resolved → 基于胜出证据生成确定答案（模板化，不调 LLM）
+        winner_side = result.get("winner_side")
+        winner_ev = result.get("winner_evidence") or {}
+        if winner_side == "oppose":
+            # 反对侧胜出（如文本"不再负责"）→ 明确否定式回答
+            state["answer"] = (
+                f"根据知识库中的最新信息，{entity}不再{rel}"
+                f"（{winner_ev.get('text', '')[:60]}）。"
+            )
+        else:
+            # 支持侧胜出 → 正向回答
+            target = winner_ev.get("target") or winner_ev.get("text", "")[:30]
+            state["answer"] = f"根据知识库信息，{entity}{rel}{target}。"
+        state["evidence_status"] = "resolved"
+        logger.info(f"[Conflict] resolved（{winner_side}），answer: {state['answer']}")
+        return state
+
     def global_node(state: AgentState) -> AgentState:
         """全局分析节点"""
         query = state["query"]
@@ -499,6 +688,12 @@ def create_orchestrator_graph(
         # 修复 v2.1：语义缓存命中 → 跳过 LLM，直接复用缓存里的最终答案
         if state.get("from_cache"):
             logger.info(f"[Answer] 缓存命中，跳过 LLM 生成（route={route}）")
+            return state
+
+        # v2.2：证据不足或冲突 → 不调 LLM，直接返回拒答/冲突文案
+        # 关键：不让 LLM 基于"参与"之类不充分证据自由推断"负责"
+        if state.get("evidence_status") in ("insufficient", "conflict"):
+            logger.info(f"[Answer] 证据状态={state.get('evidence_status')}，跳过 LLM，拒答")
             return state
 
         with tracer.start_span("answer_generation", route=route) as span:
@@ -563,6 +758,10 @@ def create_orchestrator_graph(
     workflow.add_node("router", router_node)
     workflow.add_node("local", local_node)
     workflow.add_node("global", global_node)
+    workflow.add_node("evidence_validator", evidence_validator_node)
+    workflow.add_node("targeted_graph", targeted_graph_node)
+    workflow.add_node("refuse", refuse_node)
+    workflow.add_node("conflict", conflict_node)
     workflow.add_node("answer", answer_node)
 
     # 设置入口
@@ -587,17 +786,50 @@ def create_orchestrator_graph(
         if state.get("fallback_to_global"):
             logger.warning("[Local] 检索失败，降级切换到 global 分析")
             return "global"
-        return "answer"
+        return "evidence_validator"
 
     workflow.add_conditional_edges(
         "local",
         local_after,
         {
-            "global": "global",   # local 挂了 → global 兜底
-            "answer": "answer"    # local 成功 → 正常生成
+            "global": "global",          # local 挂了 → global 兜底
+            "evidence_validator": "evidence_validator"   # v2.2: local 成功 → 证据验证
         }
     )
+
+    # v2.2：证据验证 → 按 next_action 分流
+    #  - answer          → 证据充足，正常生成
+    #  - targeted_graph  → 证据不足（首次）→ 定向图谱补充召回
+    #  - refuse          → 证据不足（已重试）→ 拒答
+    #  - conflict        → 冲突证据 → 冲突处理（预留）
+    def evidence_after(state: AgentState) -> str:
+        action = state.get("next_action", "answer")
+        # 保险：超过 max_steps 不再重查，避免循环
+        if action == "targeted_graph" and state.get("step_count", 0) >= state.get("max_steps", 15):
+            logger.warning("[Evidence] 步数超限，targeted_graph 转 refuse")
+            return "refuse"
+        logger.info(f"[Evidence] 决策: {action}")
+        return action
+
+    workflow.add_conditional_edges(
+        "evidence_validator",
+        evidence_after,
+        {
+            "answer": "answer",
+            "targeted_graph": "targeted_graph",
+            "refuse": "refuse",
+            "conflict": "conflict",
+        }
+    )
+
+    # v2.2：定向图谱检索后 → 回到证据验证（二次判断）
+    # 此时 targeted_retried=True，若仍不足 → refuse
+    workflow.add_edge("targeted_graph", "evidence_validator")
+
     workflow.add_edge("global", "answer")
+    # 拒答/冲突直接结束（answer 已在节点内设置）
+    workflow.add_edge("refuse", END)
+    workflow.add_edge("conflict", END)
 
     # answer → 结束
     workflow.add_edge("answer", END)
@@ -645,7 +877,13 @@ class AgentOrchestratorV2:
         # 各组件引用（供外部直接使用）
         self.retriever = HybridRetriever(neo4j_client, milvus_client)
         self.reranker = BGEReranker()
-        self.cache = SemanticCache(encoder=self.reranker.model) if use_cache else None
+        self.cache = SemanticCache(
+            encoder=self.reranker.model,
+            similarity_threshold=Config.CACHE_SIMILARITY_THRESHOLD,
+            ttl=Config.CACHE_TTL,
+            max_size=Config.CACHE_MAX_SIZE,
+            knowledge_version=Config.KNOWLEDGE_VERSION,
+        ) if use_cache else None
 
     def process(self, query: str) -> Dict[str, Any]:
         """

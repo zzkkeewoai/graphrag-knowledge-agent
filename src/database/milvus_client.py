@@ -18,6 +18,8 @@ class MilvusClient:
         self.port = port
         self.collection = None
         self.encoder = SentenceTransformer('all-MiniLM-L6-v2')  # 384维，轻量快速
+        self._loaded = False        # v2.2: 集合加载状态标记（避免热路径重复 load）
+        self._embed_batch_size = 64  # v2.2: batch embedding 批次大小
 
     def connect(self):
         """连接Milvus"""
@@ -28,12 +30,23 @@ class MilvusClient:
         """断开连接"""
         connections.disconnect("default")
 
-    def create_collection(self, collection_name: str = "document_chunks"):
-        """创建向量集合"""
+    def create_collection(self, collection_name: str = "document_chunks", drop_existing: bool = False):
+        """创建向量集合
+
+        工程化修复（v2.2）：原实现"集合存在则直接 drop 重建"——正常启动可能
+        导致数据丢失。改为 drop_existing 参数控制，默认 False（存在则复用，
+        仅当集合不存在时创建），显式传入 True 才重建。
+        """
         # 检查是否已存在
         if utility.has_collection(collection_name):
-            logger.info(f"集合 {collection_name} 已存在，删除重建")
-            utility.drop_collection(collection_name)
+            if drop_existing:
+                logger.warning(f"集合 {collection_name} 已存在，按 drop_existing=True 删除重建")
+                utility.drop_collection(collection_name)
+            else:
+                logger.info(f"集合 {collection_name} 已存在，复用（如需重建请传 drop_existing=True）")
+                self.collection = Collection(collection_name)
+                self._loaded = False
+                return self.collection
 
         # 定义Schema
         fields = [
@@ -73,36 +86,55 @@ class MilvusClient:
 
         return chunks
 
-    def insert_chunks(self, doc_id: str, chunks: List[str]) -> int:
-        """插入文档块"""
+    def insert_chunks(self, doc_id: str, chunks: List[str], chunk_offset: int = 0) -> int:
+        """插入文档块
+
+        工程化修复（v2.2）：
+        1. batch embedding（避免一次性 encode 超大列表）
+        2. chunk_index 支持全局偏移（batch 处理时跨批次连续，不每批从 0 开始）
+        3. flush 只在整批插入后执行一次（非逐条）
+        4. 插入后标记集合可 load（search 前只需 load 一次）
+        """
         if not chunks:
             return 0
 
-        # 生成向量
-        embeddings = self.encoder.encode(chunks, show_progress_bar=False)
+        # batch embedding（分片避免内存峰值）
+        all_embeddings = []
+        for i in range(0, len(chunks), self._embed_batch_size):
+            batch = chunks[i:i + self._embed_batch_size]
+            batch_emb = self.encoder.encode(batch, show_progress_bar=False)
+            all_embeddings.extend(batch_emb.tolist())
 
-        # 准备数据
+        # 准备数据（chunk_index 从 chunk_offset 开始，支持全局连续）
         data = [
-            chunks,  # chunk_text
-            [doc_id] * len(chunks),  # doc_id
-            list(range(len(chunks))),  # chunk_index
-            embeddings.tolist()  # embedding
+            chunks,                                   # chunk_text
+            [doc_id] * len(chunks),                   # doc_id
+            list(range(chunk_offset, chunk_offset + len(chunks))),  # chunk_index（全局连续）
+            all_embeddings,                           # embedding
         ]
 
-        # 插入
+        # 整批插入 + 一次 flush
         self.collection.insert(data)
         self.collection.flush()
-        logger.info(f"插入 {len(chunks)} 个文档块到Milvus")
+        logger.info(f"插入 {len(chunks)} 个文档块到Milvus (chunk_offset={chunk_offset})")
 
         return len(chunks)
 
     def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-        """向量检索"""
+        """向量检索
+
+        工程化修复（v2.2）：
+        - 原实现每次 search 都调用 collection.load() —— 高频查询热路径上
+          反复加载集合索引，是明显性能问题。
+        - 改为：load() 只发生在集合创建/数据写入后的初始化阶段（见 load_if_needed /
+          insert_chunks），search 热路径不再重复 load。
+        """
         if self.collection is None:
             logger.warning("Milvus 集合未初始化，返回空结果")
             return []
-        # 加载集合到内存
-        self.collection.load()
+        # 修复：load 不在 search 热路径执行。若集合尚未 load（例如进程重启后
+        # 只调 search 未走 insert），做一次幂等 load 兜底（内部有状态标记，非每次）。
+        self._ensure_loaded()
 
         # 查询向量
         query_vector = self.encoder.encode([query])
@@ -129,3 +161,23 @@ class MilvusClient:
                 })
 
         return formatted_results
+
+    # ----------------------------------------------------------
+    # 集合加载生命周期（v2.2 新增）
+    # ----------------------------------------------------------
+    def _ensure_loaded(self):
+        """幂等加载集合（仅当尚未加载时执行一次）。
+
+        Milvus collection.load() 之后再次调用是幂等的，但每次调用都有
+        状态检查开销；这里用本地标记避免热路径重复判断。
+        """
+        if self._loaded:
+            return
+        self.collection.load()
+        self._loaded = True
+        logger.debug("Milvus 集合已加载")
+
+    def load_if_needed(self):
+        """显式加载集合（初始化/启动阶段调用，供编排器 startup 使用）"""
+        if self.collection is not None:
+            self._ensure_loaded()

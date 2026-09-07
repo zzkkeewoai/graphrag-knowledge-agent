@@ -128,6 +128,21 @@ class FakeNeo4j:
     def __init__(self):
         self.driver = type("Driver", (), {"session": lambda self: FakeNeo4j.Session()})()
 
+    # v2.2: Evidence Validator 的定向图谱检索（测试适配）
+    def query_entity_by_relation(self, entity_name: str, relation_type: str) -> list:
+        """返回与 entity + relation_type 精确匹配的边（模拟 targeted retrieval）"""
+        results = []
+        for row in FakeNeo4j.HOP1_ROWS:
+            if row["entity"] == entity_name and row["rel"] == relation_type:
+                results.append({
+                    "entity": row["entity"],
+                    "relation": row["rel"],
+                    "target": row["target"],
+                    "target_type": row.get("ttype", ""),
+                    "confidence": row["conf"],
+                })
+        return results
+
 
 class FakeMilvus:
     """fail_mode=True 时模拟向量库故障（local 检索必然失败）"""

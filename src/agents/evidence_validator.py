@@ -48,8 +48,16 @@ NEGATION_KEYWORDS = ["不再", "没有", "未", "不负责", "已卸任", "已�
 # 疑问/无意义词（用于从 query 提取目标实体时的占位）
 _QUESTION_WORDS = ["哪些", "什么", "哪个", "谁", "多少", "如何", "怎么", "呢", "？", "?", "了", "的", "是", "在"]
 
-# 常见宾语/对象词（"张三负责的项目"里"项目"是对象不是实体主语）
-_OBJECT_WORDS = ["项目", "系统", "技术", "模块", "产品", "服务", "平台", "任务", "工作", "方面", "有哪些", "什么", "哪个"]
+# 常见宾语中心词：**只在词尾**去除（"张三负责哪些项目" → "张三"）
+# 【v2.2 修复】原来用全局 replace 删除这些词，会把实体本身拆坏：
+#   "C项目用了什么通信协议" → 删掉"项目" → "C通信协议"（错误实体）
+#   → targeted 定向补召回查不到 → 误判 insufficient → 误拒答
+_TAIL_OBJECT_WORDS = ["项目", "系统", "技术", "模块", "产品", "服务", "平台", "任务", "工作", "方面"]
+
+# 相关性兜底阈值：无目标关系且实体未在证据中出现时，用最高重排分判断是否相关。
+# 依据实测分布：相关问题 rerank_score ≥ 0.67，知识库外的无关问题 ≤ 0.60。
+# 该阈值可通过评测集回归调优。
+MIN_EVIDENCE_SCORE = 0.62
 
 
 def extract_target_relation(query: str) -> Optional[str]:
@@ -57,7 +65,7 @@ def extract_target_relation(query: str) -> Optional[str]:
 
     query: "张三负责哪些项目？"  →  "负责"
     query: "张三依赖什么系统？"  →  "依赖"
-    提取不到返回 None（此时证据验证退化为"是否检索到内容"）。
+    提取不到返回 None（此时证据验证退化为"证据是否与问题相关"）。
     """
     for rel, keywords in RELATION_KEYWORDS.items():
         for kw in keywords:
@@ -70,26 +78,34 @@ def extract_target_entity(query: str, known_entities: List[str]) -> Optional[str
     """提取目标实体。
 
     优先：从检索结果里已知实体中，找出出现在 query 里的那个（最可靠）。
-    兜底：query 去掉关系词/疑问词/宾语词后，取首段 2-6 字片段
-          （简单启发式，仅作为 known_entities 缺失时的后备，不引入新依赖）。
+    兜底：去掉关系词/疑问词，再**只在词尾**去掉宾语中心词，长度须在 2-6 字内；
+          超出范围返回 None —— **宁可不补召回，也不要拿错误实体去查**
+          （查错实体比不查更糟：会把"本可回答"的问题变成误拒答）。
     """
-    # 1. 已知实体匹配（graph_results 里的 entity 出现在 query 中）
+    # 1. 已知实体匹配（graph_results / 向量结果里出现过的实体）
     for ent in known_entities:
         if ent and ent in query:
             return ent
 
-    # 2. 启发式：去掉关系词/疑问词/宾语词
+    # 2. 启发式兜底
     cleaned = query
-    for rel, keywords in RELATION_KEYWORDS.items():
+    for _rel, keywords in RELATION_KEYWORDS.items():
         for kw in keywords:
             cleaned = cleaned.replace(kw, "")
-    for w in _QUESTION_WORDS + _OBJECT_WORDS:
+    for w in _QUESTION_WORDS:
         cleaned = cleaned.replace(w, "")
-    # 再去掉残留标点
+    # 去掉残留标点
     cleaned = re.sub(r"[？?。，,！!、\s]", "", cleaned)
+
+    # 只在词尾去掉宾语中心词（保留 "C项目" 这类实体内的"项目"）
+    for w in _TAIL_OBJECT_WORDS:
+        if cleaned.endswith(w) and len(cleaned) > len(w) + 1:
+            cleaned = cleaned[: -len(w)]
+            break
+
     cleaned = cleaned.strip()
-    # 中文人名/实体通常在 2-6 字；取清洗后整体
-    if 1 <= len(cleaned) <= 12:
+    # 中文实体名通常 2-6 字；超范围返回 None（不猜）
+    if 2 <= len(cleaned) <= 6:
         return cleaned
     return None
 
@@ -229,7 +245,12 @@ class EvidenceValidator:
 
         # 无目标关系：退化为"有没有检索到内容"
         if not target_relation:
-            if graph_results or documents:
+            # 【v2.2 修复】原实现只判断"有没有检索到内容"（graph_results or documents），
+            # 导致知识库外的问题（"今天天气怎么样？"）拿到 3 条不相关文档后
+            # 被判 sufficient 并输出答案 → 答非所问。
+            # 这里补一道相关性校验：证据必须与问题相关，否则按 insufficient 走
+            # 定向补召回 → 仍不足则拒答。
+            if self._evidence_is_related(target_entity, graph_results, documents):
                 return self._sufficient(query, target_relation, target_entity)
             return self._insufficient(query, target_relation, target_entity, targeted_retried)
 
@@ -315,6 +336,40 @@ class EvidenceValidator:
         # 没有任何正向证据 → insufficient（无论有没有 partial）
         return self._insufficient(query, target_relation, target_entity,
                                   targeted_retried, evidence_detail=evidence_detail)
+
+    # ----------------------------------------------------------
+    # 相关性校验（无明确目标关系时使用）
+    # ----------------------------------------------------------
+    def _evidence_is_related(
+        self,
+        target_entity: Optional[str],
+        graph_results: List[Dict],
+        documents: List[Dict],
+    ) -> bool:
+        """判断检索到的证据是否与问题相关（而非只看"有没有检索到东西"）。
+
+        判据优先级：
+          1. 有结构化图谱证据（graph_results 非空）→ 相关
+             —— 图谱结果本身就是按 query 实体匹配出来的，带结构信息；
+          2. 目标实体出现在证据文本里 → 相关
+             —— 最可靠的语义判据（"智能客服系统" 出现在文档里才是相关）；
+          3. 兜底看最高重排分是否达到阈值（MIN_EVIDENCE_SCORE）。
+
+        这样"今天天气怎么样？"这类知识库外的问题会被判为不相关 → 走定向补召回
+        → 仍无证据则拒答，而不是把 3 条最相似的无关文档当成答案返回。
+        """
+        if graph_results:
+            return True
+
+        texts = [str(d.get("text", "")) for d in (documents or [])]
+        if target_entity and any(target_entity in t for t in texts):
+            return True
+
+        scores = [
+            float(d.get("rerank_score") or d.get("score") or 0.0)
+            for d in (documents or [])
+        ]
+        return bool(scores) and max(scores) >= MIN_EVIDENCE_SCORE
 
     # ----------------------------------------------------------
     # 结果构造

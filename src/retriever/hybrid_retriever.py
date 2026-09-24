@@ -102,18 +102,23 @@ class HybridRetriever:
             query_words = self._extract_keywords(query, include_windows=False)
             with self.neo4j.driver.session() as session:
                 # 过滤在 Cypher 内完成：query 直接包含实体名，或实体名包含任一关键词
+                # 【v2.2 修复·致命】参数名绝不能叫 query —— Session.run(query, parameters)
+                # 的第一个形参就叫 query，再用 query=... 传关键字参数会直接抛：
+                #   TypeError: Session.run() got multiple values for argument 'query'
+                # 而异常被下面的 except 吞掉，表现为"图谱检索永远返回 0 条结果"，
+                # 进而 known_entities 为空、实体抽取走兜底抽错、证据永远 insufficient。
                 node_result = session.run(
                     """
                     MATCH (e:Entity)-[r:RELATES_TO]->(t:Entity)
-                    WHERE $query CONTAINS e.name
-                       OR $query CONTAINS t.name
+                    WHERE $q CONTAINS e.name
+                       OR $q CONTAINS t.name
                        OR any(kw IN $keywords WHERE e.name CONTAINS kw OR t.name CONTAINS kw)
                     RETURN e.name AS entity, e.type AS etype,
                            r.relation_type AS rel, r.confidence AS conf,
                            t.name AS target, t.type AS ttype
                     LIMIT 2000
                     """,
-                    query=query, keywords=list(query_words)
+                    q=query, keywords=list(query_words)
                 )
                 rows = list(node_result)
         except Exception as e:

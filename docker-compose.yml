@@ -30,6 +30,16 @@ services:
       - minio
     restart: unless-stopped
 
+  redis:
+    image: redis:7-alpine
+    container_name: graphrag_redis
+    ports:
+      - "6379:6379"
+    # appendonly yes：开启 AOF 持久化，重启不丢缓存
+    # （缓存丢了会全量打回后端检索，代价是成本和延迟）
+    command: redis-server --appendonly yes
+    restart: unless-stopped
+
   etcd:
     image: quay.io/coreos/etcd:v3.5.5
     container_name: graphrag_etcd

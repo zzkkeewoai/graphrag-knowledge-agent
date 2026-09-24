@@ -1,13 +1,29 @@
+# ============ LLM 调用与数据校验 ============
 openai>=1.0.0
 pydantic>=2.0.0
 python-dotenv>=1.0.0
+
+# ============ 存储：图数据库 + 向量库 + 分布式缓存 ============
 neo4j>=5.14.0
 pymilvus>=2.3.0
-llama-index>=0.10.0
+redis>=5.0.0
+
+# ============ 检索与 Agent 编排 ============
 sentence-transformers>=2.2.0
 langgraph>=0.2.0
-langchain>=0.3.0
 numpy>=1.24.0
 tiktoken>=0.5.0
+
+# ============ 服务化（HTTP 接口）============
+fastapi>=0.110.0
+uvicorn>=0.29.0
+
+# ============ 可观测性（Prometheus 指标）============
+prometheus-client>=0.20.0
+
+# ============ 评测（Ragas 四项指标）============
 ragas>=0.2.0
 datasets>=2.14.0
+
+# ============ 压测（可选，仅开发用）============
+locust>=2.20.0

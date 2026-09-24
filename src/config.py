@@ -46,6 +46,11 @@ class Config:
     CACHE_SIMILARITY_THRESHOLD = float(os.getenv("CACHE_SIMILARITY_THRESHOLD", "0.92"))
     # 知识库版本（v2.2: 知识更新时 bump，旧缓存自动失效）
     KNOWLEDGE_VERSION = os.getenv("KNOWLEDGE_VERSION", "1")
+    # v2.2: 分布式语义缓存（多实例共享、重启不丢；Redis 不可用时自动回退进程内）
+    USE_REDIS_CACHE = os.getenv("USE_REDIS_CACHE", "false").lower() == "true"
+    REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+    REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+    REDIS_DB = int(os.getenv("REDIS_DB", "0"))
 
     # ----------------------------------------------------------
     # 启动配置校验（v2.2：缺关键配置快速失败，而不是运行期才报错）

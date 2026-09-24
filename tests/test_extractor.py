@@ -3,8 +3,18 @@ import os
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.extractors.triple_extractor import TripleExtractor
-from src.config import Config
+import pytest  # noqa: E402
+
+from src.extractors.triple_extractor import TripleExtractor  # noqa: E402
+from src.config import Config  # noqa: E402
+
+# 这两个测试会真实调用 LLM 抽取，需要 API key。
+# 没有 key 时跳过而不是失败——否则本地/CI 上无 key 环境永远红，
+# 会掩盖真正的失败（"永远红的测试等于没有测试"）。
+requires_api_key = pytest.mark.skipif(
+    not Config.DEEPSEEK_API_KEY,
+    reason="需要 DEEPSEEK_API_KEY（真实调用 LLM 做三元组抽取）",
+)
 
 # 测试数据
 TEST_DOCS = [
@@ -27,6 +37,7 @@ TEST_DOCS = [
 ]
 
 
+@requires_api_key
 def test_single_extraction():
     """测试单个文档抽取"""
     extractor = TripleExtractor(
@@ -54,6 +65,7 @@ def test_single_extraction():
     return result
 
 
+@requires_api_key
 def test_batch_extraction():
     """测试批量抽取"""
     extractor = TripleExtractor(

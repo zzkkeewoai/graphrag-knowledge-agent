@@ -299,22 +299,27 @@ class GlobalAnalysisAgent:
 
 class AnswerAgent:
     """
-    答案生成 Agent：模板（开发） / LLM（生产）
+    答案生成 Agent：模板（开发） / LLM（生产，多 provider 热备）
     """
 
     def __init__(self, use_llm: bool = False):
         self.use_llm = use_llm
-        self._client = None
+        self._providers = None
         if use_llm:
-            from openai import OpenAI
-            self._client = OpenAI(
-                api_key=os.getenv("DEEPSEEK_API_KEY"),
-                base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-            )
+            from src.utils.llm_provider import LLMProviderManager
+
+            # 多 Provider 热备：按 LLM_PROVIDERS 顺序尝试，主供应商故障自动切备用
+            self._providers = LLMProviderManager.from_env()
 
     def generate(self, query: str, agent_result: Dict[str, Any]) -> str:
-        if self.use_llm and self._client:
-            return self._generate_with_llm(query, agent_result)
+        if self.use_llm and self._providers:
+            try:
+                return self._generate_with_llm(query, agent_result)
+            except Exception as e:  # noqa: BLE001
+                # 所有 LLM provider 都不可用 → 降级为模板生成。
+                # 关键：LLM 挂了不能把整个请求变成 500，用户仍应拿到基于检索证据
+                # 的可读答案（这与项目整体的"任何一层挂掉都有人接"一致）。
+                logger.error(f"[Answer] LLM 生成失败，降级为模板生成: {e}")
         return self._generate_with_template(query, agent_result)
 
     def _generate_with_template(self, query: str, result: Dict[str, Any]) -> str:
@@ -335,7 +340,7 @@ class AnswerAgent:
             return f"{context}\n{summary}"
 
     def _generate_with_llm(self, query: str, result: Dict[str, Any]) -> str:
-        """LLM 生成（高质量）"""
+        """LLM 生成（多 provider 热备；全部失败时由调用方降级为模板）"""
         if result["type"] == "local":
             docs = result.get("documents", [])
             context = "\n".join([f"- {d.get('text', '')}" for d in docs[:5]])
@@ -352,13 +357,8 @@ class AnswerAgent:
                 f"全局信息:\n{context}"
             )
 
-        response = self._client.chat.completions.create(
-            model=os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
-            max_tokens=500
-        )
-        return response.choices[0].message.content
+        # 交给 ProviderManager：内部按优先级尝试，失败自动切换下一个 provider
+        return self._providers.chat(prompt, temperature=0.3, max_tokens=500)
 
 
 # ============================================================
@@ -371,6 +371,46 @@ FALLBACK_ANSWERS = {
     "error": "抱歉，处理您的请求时遇到了技术问题。我们的工程师已收到通知，请稍后重试。",
     "empty_graph": "当前知识图谱尚未建立。请先导入文档以构建知识库。"
 }
+
+
+# ============================================================
+# 语义缓存构建（进程内 / Redis 可切换）
+# ============================================================
+
+def _build_semantic_cache(encoder):
+    """按配置构建语义缓存后端。
+
+    - `USE_REDIS_CACHE=true` → RedisSemanticCache（多实例共享、重启不丢、TTL 由
+      Redis 原生过期保证一致）；
+    - 否则 → 进程内 SemanticCache（零依赖，适合单机/开发）。
+
+    无论哪种后端，**失败都不会影响问答主链路**：Redis 连接不上时 RedisSemanticCache
+    内部会自动降级为进程内实现。
+    """
+    if Config.USE_REDIS_CACHE:
+        try:
+            from src.utils.redis_cache import RedisSemanticCache
+
+            return RedisSemanticCache(
+                encoder=encoder,
+                host=Config.REDIS_HOST,
+                port=Config.REDIS_PORT,
+                db=Config.REDIS_DB,
+                similarity_threshold=Config.CACHE_SIMILARITY_THRESHOLD,
+                ttl=Config.CACHE_TTL,
+                max_size=Config.CACHE_MAX_SIZE,
+                knowledge_version=Config.KNOWLEDGE_VERSION,
+            )
+        except Exception as e:  # noqa: BLE001 - 缓存层故障不能阻断启动
+            logger.warning(f"Redis 语义缓存初始化失败，回退进程内缓存: {e}")
+
+    return SemanticCache(
+        encoder=encoder,
+        similarity_threshold=Config.CACHE_SIMILARITY_THRESHOLD,
+        ttl=Config.CACHE_TTL,
+        max_size=Config.CACHE_MAX_SIZE,
+        knowledge_version=Config.KNOWLEDGE_VERSION,
+    )
 
 
 # ============================================================
@@ -404,14 +444,9 @@ def create_orchestrator_graph(
     global_agent = GlobalAnalysisAgent(neo4j_client)
     answer_agent = AnswerAgent(use_llm=use_llm)
 
-    # 语义缓存（v2.2: threshold/max_size/knowledge_version 配置化）
-    cache = SemanticCache(
-        encoder=reranker.model,
-        similarity_threshold=Config.CACHE_SIMILARITY_THRESHOLD,
-        ttl=Config.CACHE_TTL,
-        max_size=Config.CACHE_MAX_SIZE,
-        knowledge_version=Config.KNOWLEDGE_VERSION,
-    ) if use_cache else None
+    # 语义缓存（v2.2: threshold/max_size/knowledge_version 配置化；
+    # 支持 Redis 分布式后端，多实例共享、重启不丢；Redis 不可用时自动回退进程内）
+    cache = _build_semantic_cache(encoder=reranker.model) if use_cache else None
 
     # 证据验证器（v2.2 新增，确定性规则，不调 LLM）
     evidence_validator = EvidenceValidator()
@@ -837,6 +872,20 @@ def create_orchestrator_graph(
     # 编译图
     app = workflow.compile()
     logger.info("LangGraph Agent 编排器已就绪")
+
+    # 【v2.2 修复】把图内部真正使用的组件暴露出来，供服务层/统计复用。
+    # 原来 AgentOrchestratorV2 又各自 new 了一份 retriever/reranker/cache：
+    #   ① 同一个 embedding 模型被重复加载（启动慢、内存翻倍）；
+    #   ② get_cache_stats() 返回的是**从未参与请求处理**的那个 cache 实例，
+    #      导致监控上缓存命中率永远是 0（数据失真，排查时严重误导）。
+    app._graphrag_components = {  # type: ignore[attr-defined]
+        "cache": cache,
+        "retriever": retriever,
+        "reranker": reranker,
+        "local_agent": local_agent,
+        "global_agent": global_agent,
+        "answer_agent": answer_agent,
+    }
     return app
 
 
@@ -874,16 +923,22 @@ class AgentOrchestratorV2:
             max_steps=max_steps
         )
 
-        # 各组件引用（供外部直接使用）
-        self.retriever = HybridRetriever(neo4j_client, milvus_client)
-        self.reranker = BGEReranker()
-        self.cache = SemanticCache(
-            encoder=self.reranker.model,
-            similarity_threshold=Config.CACHE_SIMILARITY_THRESHOLD,
-            ttl=Config.CACHE_TTL,
-            max_size=Config.CACHE_MAX_SIZE,
-            knowledge_version=Config.KNOWLEDGE_VERSION,
-        ) if use_cache else None
+        # 复用图内部实际使用的组件（而不是重新实例化）：
+        #   - 避免同一个 embedding 模型被重复加载（启动更快、内存不翻倍）
+        #   - get_cache_stats() 才能反映真实缓存命中情况
+        components = getattr(self.graph, "_graphrag_components", {})
+        self.retriever = components.get("retriever") or HybridRetriever(neo4j_client, milvus_client)
+        self.reranker = components.get("reranker") or BGEReranker()
+        if use_cache:
+            self.cache = components.get("cache") or SemanticCache(
+                encoder=self.reranker.model,
+                similarity_threshold=Config.CACHE_SIMILARITY_THRESHOLD,
+                ttl=Config.CACHE_TTL,
+                max_size=Config.CACHE_MAX_SIZE,
+                knowledge_version=Config.KNOWLEDGE_VERSION,
+            )
+        else:
+            self.cache = None
 
     def process(self, query: str) -> Dict[str, Any]:
         """
@@ -930,6 +985,9 @@ class AgentOrchestratorV2:
         elapsed_ms = (time.time() - start) * 1000
 
         # 构建返回结果
+        # 说明：额外暴露 evidence_status / conflict_status / from_cache，
+        # 供服务层记录 Prometheus 业务指标（拒答率、证据分布、缓存命中率）——
+        # 这些是 RAG 系统"答案质量"的先行指标，比 HTTP 指标更早暴露问题。
         return {
             "query": query,
             "route": final_state.get("route", "local"),
@@ -938,6 +996,9 @@ class AgentOrchestratorV2:
             "latency_ms": round(elapsed_ms, 1),
             "step_count": final_state.get("step_count", 0),
             "error_message": final_state.get("error_message", None),
+            "evidence_status": final_state.get("evidence_status"),
+            "conflict_status": final_state.get("conflict_status"),
+            "from_cache": bool(final_state.get("from_cache")),
             "trace": tracer.get_trace_tree(),
         }
 

@@ -2,6 +2,7 @@ import logging
 from typing import List, Dict, Any
 from neo4j import GraphDatabase, Result
 from src.schemas.graph_schema import Triple
+from src.utils.entity_normalizer import normalize_entity_name
 
 logger = logging.getLogger(__name__)
 
@@ -30,32 +31,59 @@ class Neo4jClient:
             session.run("CREATE INDEX entity_type_idx IF NOT EXISTS FOR (n:Entity) ON (n.type)")
             logger.info("索引创建完成")
 
+    @staticmethod
+    def _entity_row(triple: Triple) -> Dict[str, Any]:
+        """把三元组转成写入参数 —— **实体名在这里规范化**。
+
+        为什么单独抽成静态方法：
+            写路径有两条（单条 `write_triple` / 批量 `batch_write`）。
+            如果各自手写一遍规范化，**迟早有一条会漏**（这正是"策略散落在各处"
+            的经典失效）。抽出来之后两条路径共用同一份逻辑，
+            而且**能脱离 Neo4j 做单元测试**。
+
+        为什么同时写 name 和 display_name：
+            name         规范化后的键  → 用于 MERGE，保证同一实体只有一个节点
+            display_name 原始写法      → 用于展示（保留人类可读形式）
+
+        为什么 display_name 用 coalesce（首次写入优先）：
+            同一个实体可能有多种原始写法（"张三" / "张三 " / "Ａ项目"）。
+            如果每次都覆盖，展示出来的名字就取决于**抽取顺序**，不稳定。
+            让第一次写入的写法留下，展示名才是确定的。
+        """
+        return {
+            "head": normalize_entity_name(triple.head),
+            "head_display": triple.head,
+            "head_type": triple.head_type.value,
+            "tail": normalize_entity_name(triple.tail),
+            "tail_display": triple.tail,
+            "tail_type": triple.tail_type.value,
+            "relation_type": triple.relation.value,
+            "confidence": triple.confidence,
+        }
+
     def write_triple(self, triple: Triple) -> bool:
         """写入单个三元组
 
         用统一的关系类型 RELATES_TO 存储，通过 relation_type 属性区分关系种类，
         避免 Cypher 中关系类型无法参数化的问题，也无需依赖 APOC 插件。
+
+        实体名经 `normalize_entity_name` 规范化后作为节点唯一键 ——
+        否则"同一个实体的不同写法"会静默变成两个节点（见 entity_normalizer 的说明）。
         """
         with self.driver.session() as session:
             cypher = """
             MERGE (h:Entity {name: $head})
-            SET h.type = $head_type
+            SET h.type = $head_type,
+                h.display_name = coalesce(h.display_name, $head_display)
             MERGE (t:Entity {name: $tail})
-            SET t.type = $tail_type
+            SET t.type = $tail_type,
+                t.display_name = coalesce(t.display_name, $tail_display)
             MERGE (h)-[r:RELATES_TO]->(t)
             SET r.relation_type = $relation_type,
                 r.confidence = $confidence
             RETURN h, r, t
             """
-            result = session.run(
-                cypher,
-                head=triple.head,
-                head_type=triple.head_type.value,
-                tail=triple.tail,
-                tail_type=triple.tail_type.value,
-                relation_type=triple.relation.value,
-                confidence=triple.confidence
-            )
+            result = session.run(cypher, **self._entity_row(triple))
             return result.single() is not None
 
     def batch_write(self, triples: List[Triple], batch_size: int = 500,
@@ -78,9 +106,11 @@ class Neo4jClient:
                 """
                 UNWIND $rows AS row
                 MERGE (h:Entity {name: row.head})
-                SET h.type = row.head_type
+                SET h.type = row.head_type,
+                    h.display_name = coalesce(h.display_name, row.head_display)
                 MERGE (t:Entity {name: row.tail})
-                SET t.type = row.tail_type
+                SET t.type = row.tail_type,
+                    t.display_name = coalesce(t.display_name, row.tail_display)
                 MERGE (h)-[r:RELATES_TO]->(t)
                 SET r.relation_type = row.relation_type,
                     r.confidence = row.confidence
@@ -89,14 +119,9 @@ class Neo4jClient:
             )
 
         def _to_row(t: Triple) -> dict:
-            return {
-                "head": t.head,
-                "head_type": t.head_type.value,
-                "tail": t.tail,
-                "tail_type": t.tail_type.value,
-                "relation_type": t.relation.value,
-                "confidence": t.confidence,
-            }
+            # 复用 _entity_row —— 批量路径和单条路径必须走同一份规范化逻辑，
+            # 否则两条写入路径会产生不一致的节点键
+            return Neo4jClient._entity_row(t)
 
         # 按 batch_size 分批
         for i in range(0, len(triples), batch_size):
@@ -129,7 +154,11 @@ class Neo4jClient:
         return {"success": success, "failed": failed}
 
     def query_tech_stack(self, project_name: str) -> List[str]:
-        """查询项目使用的技术栈"""
+        """查询项目使用的技术栈
+
+        入参同样要规范化 —— 写入时用了规范键，查询时必须用同一套规则，
+        否则会出现"数据明明写进去了却查不到"的诡异现象。
+        """
         with self.driver.session() as session:
             result = session.run(
                 """
@@ -137,7 +166,7 @@ class Neo4jClient:
                 WHERE r.relation_type = '使用'
                 RETURN t.name AS tech
                 """,
-                name=project_name
+                name=normalize_entity_name(project_name)
             )
             return [record["tech"] for record in result]
 
@@ -150,7 +179,7 @@ class Neo4jClient:
                 WHERE r.relation_type = '依赖'
                 RETURN p2.name AS depends_on, r.confidence AS confidence
                 """,
-                name=project_name
+                name=normalize_entity_name(project_name)
             )
             return [{"project": record["depends_on"], "confidence": record["confidence"]} for record in result]
 
@@ -172,6 +201,13 @@ class Neo4jClient:
         if not entity_name or not relation_type:
             return []
         try:
+            entity_key = normalize_entity_name(entity_name)
+        except (TypeError, ValueError):
+            # 实体名非法（空 / 全是不可见字符）→ 当作"查不到"处理，
+            # 由调用方走 insufficient / refuse，绝不抛错打断整条链路
+            logger.warning(f"实体名非法，跳过定向检索: {entity_name!r}")
+            return []
+        try:
             with self.driver.session() as session:
                 result = session.run(
                     """
@@ -184,7 +220,7 @@ class Neo4jClient:
                            r.confidence AS confidence
                     LIMIT 50
                     """,
-                    entity=entity_name,
+                    entity=entity_key,
                     rel=relation_type
                 )
                 return [

@@ -97,6 +97,62 @@ router ──→ local ──→ evidence_validator ──┬─→ answer
 
 ---
 
+### 图谱实体名的规范化（本轮新增）
+
+**问题**：图谱节点用**实体名**做唯一键（`MERGE (e:Entity {name})`），
+于是"同一个实体的不同写法"会变成两个节点 —— 而且是**静默失效**：
+不报错、不告警、日志里看不出来，只表现为"检索效果不太好"。这类"**损坏得悄无声息**"
+的失效是最难防的一种。
+
+| 类型 | 例子 |
+|---|---|
+| 空白差异 | `"张三 "` / `" 张三"` / `"张  三"` / `"张\t三"` |
+| 全半角差异 | `"Ａ项目"`（全角 A） / `"A项目"` |
+| 大小写差异 | `"Python"` / `"python"` |
+| 不可见字符 | `"张三\u200b"`（零宽空格，从网页复制粘贴带进来的） |
+
+**做法**：`src/utils/entity_normalizer.py`，四步归一（顺序不能换）：
+
+1. **NFKC** —— 全角转半角、兼容字符统一（用 stdlib，不引入新依赖）
+2. **删掉所有空白** —— 实体名是短标签，内部空格不承载语义
+3. **删掉不可见字符**（Unicode 类别 `Cf` / `Cc`）
+4. **仅当结果是纯 ASCII 时**才做大小写归一（避免其他语言的意外映射）
+
+三个设计要点：
+
+- **`name` 和 `display_name` 分开存**：`name` 是规范键（用于 MERGE），
+  `display_name` 保留原始写法（用于展示），用 `coalesce` 让**首次写入**的那份留下 ——
+  否则展示名会随抽取顺序变，不稳定。
+- **规范化后为空必须 `raise ValueError`**，不能返回空串。空串会让所有"空名字"的
+  实体合并到同一个节点上 —— 那比"不合并"严重得多（数据被污染且很难还原）。
+- **写入和查询都要规范化**。只在写入时做、查询用原名字，会出现
+  "数据明明写进去了却查不到"这种极难排查的现象。
+
+**它解决什么、不解决什么（划清界限）**：
+
+| | 说明 |
+|---|---|
+| ✅ 解决 | **格式层面的同一性**：空白 / 全半角 / 大小写 / 不可见字符 |
+| ❌ 不解决 | **语义层面的同一性**：同义实体（"张三" vs "张伟老师"）、同名实体（两个"张三"）→ 需要实体消歧，本项目未实现 |
+
+`find_similar_candidates()` 只产出**候选报告**供人工确认，**绝不自动合并** ——
+自动合并的风险是把两个真实实体错误地并成一个，数据被污染且很难还原，
+比"没合并"更糟。所以这里刻意不做"看起来更聪明"的自动合并。
+
+**⚠️ 存量数据需要迁移**：这次改动在**写入路径**上生效，所以**改动之前写进库的节点
+名字是没规范化的**，规范化后的查询会命不中它们。检查工具：
+
+```bash
+python tests/check_entity_normalization.py
+```
+
+它报告三类：未规范化的节点、规范化后会撞在一起的节点、疑似同义实体候选。
+演示库建议**清库重灌**（`python tests/seed_demo_data.py`）；
+生产环境不能清库，需要做真正的节点重命名 + 合并迁移 —— 那是另一套工作，
+脚本只**如实报告**，不假装能自动搞定。
+
+---
+
 ## 性能实测（v2.3）
 
 **压测环境**：locust，10 并发 × 30 秒，单 uvicorn worker，8GB 内存机器。
@@ -164,11 +220,13 @@ router ──→ local ──→ evidence_validator ──┬─→ answer
 
 ### 测试与验证脚本
 
-**合计 66 项自动化测试与验证**（均可本地复现）：
+**合计 129 项自动化测试与验证**（均可本地复现；其中实体名规范化相关的 63 项**不需要 Neo4j**）：
 
 | 类别 | 数量 | 命令 |
 |---|---|---|
 | pytest 单元测试 | **16**（证据验证 8 / 冲突裁决 6 / 抽取 2） | `python -m pytest tests/ -v` |
+| **实体名规范化** | **44**（空白/全半角/大小写/不可见字符 + 反向验证 + 幂等性） | `python tests/test_entity_normalizer.py` |
+| **写入路径规范化** | **19**（两条写路径共用同一逻辑 + 反向验证） | `python tests/test_neo4j_write_normalization.py` |
 | 核心逻辑回归 | 14 | `python tests/sanity_check_fixes.py` |
 | 降级路径验证 | 8 | `python tests/sanity_check_fallback.py` |
 | 多 Provider 热备 | 11 | `python tests/sanity_check_providers.py` |
@@ -177,6 +235,9 @@ router ──→ local ──→ evidence_validator ──┬─→ answer
 
 ```bash
 python -m pytest tests/ -q                  # 单元测试（无外部依赖，缺 API key 的用例自动 skip）
+python tests/test_entity_normalizer.py      # 实体名规范化（44 项，不需要 Neo4j）
+python tests/test_neo4j_write_normalization.py  # 写入路径确实用了规范化（19 项，不需要 Neo4j）
+python tests/check_entity_normalization.py  # 检查存量数据是否已规范化（需要 Neo4j）
 python tests/sanity_check_fixes.py          # 核心逻辑回归
 python tests/sanity_check_fallback.py       # 降级路径验证（local 失败切 global）
 python tests/sanity_check_providers.py      # 多 Provider 热备（故障切换 / 全挂降级 / 密钥脱敏）
@@ -266,6 +327,7 @@ graphrag_system/
 │   │   ├── metrics.py               # Prometheus 指标定义
 │   │   ├── llm_provider.py          # 多 Provider 热备
 │   │   ├── tracing.py               # Span 链路追踪
+│   │   ├── entity_normalizer.py     # ★ 实体名规范化（防"同实体多写法"静默分裂）
 │   │   └── retry_decorator.py       # 指数退避重试
 │   └── config.py                    # 全局配置 + fail-fast 校验
 ├── tests/
@@ -275,6 +337,9 @@ graphrag_system/
 │   ├── sanity_check_fixes.py        # 核心逻辑回归
 │   ├── sanity_check_fallback.py     # 降级路径验证
 │   ├── sanity_check_providers.py    # Provider 热备验证
+│   ├── test_entity_normalizer.py    # ★ 实体名规范化（44 项，不需 Neo4j）
+│   ├── test_neo4j_write_normalization.py  # ★ 写入路径用了规范化（19 项，不需 Neo4j）
+│   ├── check_entity_normalization.py      # ★ 存量数据规范化检查（需 Neo4j）
 │   ├── test_evidence_validator.py / test_conflict_resolver.py / ...
 │   └── evaluation/                  # Evaluation 闭环（场景数据集 + Runner）
 └── data/eval_queries.json

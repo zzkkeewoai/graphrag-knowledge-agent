@@ -31,6 +31,17 @@ class Config:
     FUSION_TOP_K = int(os.getenv("FUSION_TOP_K", "5"))
     RERANK_TOP_K = int(os.getenv("RERANK_TOP_K", "3"))
 
+    # 【截断职责划分：两处截断，作用不同，别混】
+    #   ① RERANK_POOL：rerank **之前**的候选池上限 —— 成本保护（不是相关性判断）
+    #      reranker 现在只打分不截断，若把融合后的 90+ 条全量送进去，延迟会失控。
+    #   ② CONTEXT_TOKEN_BUDGET：rerank **之后**、送 LLM 之前的 token 预算 —— 上下文预算。
+    #      用 token 而不是"固定条数"：一条法条 600-900 字、一块 FAQ 只有 50 字，
+    #      固定条数的上下文长度方差极大（实测 5 条可能是 3000 字也可能是 4500 字）。
+    RERANK_POOL = int(os.getenv("RERANK_POOL", "30"))
+    CONTEXT_TOKEN_BUDGET = int(os.getenv("CONTEXT_TOKEN_BUDGET", "3000"))
+    # 单块最大字符数（超过就截断并记日志，便于发现"法条被砍半句"）
+    MAX_CHUNK_CHARS = int(os.getenv("MAX_CHUNK_CHARS", "1500"))
+
     # 检索超时（v2.2）
     RETRIEVAL_TIMEOUT_SECONDS = float(os.getenv("RETRIEVAL_TIMEOUT_SECONDS", "5"))
 

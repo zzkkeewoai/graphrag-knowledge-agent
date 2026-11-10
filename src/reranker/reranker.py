@@ -36,9 +36,16 @@ class BGEReranker:
         self.model = SentenceTransformer(model_name)
         logger.info("Reranker 模型加载完成")
 
-    def rerank(self, query: str, documents: List[Dict], top_k: int = 3) -> List[Dict]:
-        """
-        对文档列表进行重排（基于余弦相似度）
+    def rerank(self, query: str, documents: List[Dict]) -> List[Dict]:
+        """对候选做相关性重排打分，**只排序、不截断**。
+
+        为什么去掉 top_k：
+            打分是"相关性判断"，截断是"预算决策"，两件事不该由同一个组件决定。
+            以前这里自带 `return reranked[:top_k]`，结果截断规则散落在两处
+            （精排里一批、拼 prompt 时又一批），改配置只改一处、效果没变还不知道为什么。
+            现在统一在调用方（orchestrator）做两处截断：
+              · rerank 前：RERANK_POOL 候选池上限（成本保护）
+              · rerank 后：CONTEXT_TOKEN_BUDGET token 预算（上下文预算）
         """
         if not documents:
             return []
@@ -66,4 +73,4 @@ class BGEReranker:
 
         reranked = sorted(documents, key=lambda x: x.get('rerank_score', 0), reverse=True)
 
-        return reranked[:top_k]
+        return reranked

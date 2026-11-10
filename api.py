@@ -153,6 +153,17 @@ def init_orchestrator() -> None:
         state.neo4j, state.milvus, state.orchestrator = neo4j, milvus, orchestrator
         state.status, state.error = "ready", None
         logger.info("编排器初始化完成，服务状态: ready")
+
+        # 【冷启动预热】
+        # 向量检索用的 embedding 模型是懒加载的：第一句查询才加载，
+        # 实测首次请求要 15-20s，正好撞上 20s 请求超时，评测里第一道题必挂。
+        # 启动时先编码一次空串把它拉起来，首请求就恢复正常耗时。
+        try:
+            _t0 = time.time()
+            milvus.encoder.encode([""], normalize_embeddings=True)
+            logger.info(f"embedding 预热完成（{time.time() - _t0:.2f}s）")
+        except Exception as e:  # noqa: BLE001 - 预热失败不影响启动
+            logger.warning(f"embedding 预热失败（不影响启动）: {e}")
     except Exception as e:  # noqa: BLE001 - 启动阶段任何异常都不应让服务起不来
         state.status = "degraded"
         state.error = f"{type(e).__name__}: {e}"

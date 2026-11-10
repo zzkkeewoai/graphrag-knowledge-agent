@@ -193,6 +193,25 @@ class LocalRetrievalAgent:
     def __init__(self, retriever: HybridRetriever, reranker: BGEReranker):
         self.retriever = retriever
         self.reranker = reranker
+        self._encoder = None
+
+    def _count_tokens(self, text: str) -> int:
+        """估算 token 数（用于上下文预算）。
+
+        优先用 tiktoken；不可用时退化为经验估算：
+        中文约 1.5 字符/token、英文约 4 字符/token，混排取 1.6 字符/token。
+        估算偏保守（宁可少放一条，也不要超预算）。
+        """
+        if not text:
+            return 0
+        try:
+            import tiktoken
+
+            if self._encoder is None:
+                self._encoder = tiktoken.get_encoding("cl100k_base")
+            return len(self._encoder.encode(text))
+        except Exception:  # noqa: BLE001
+            return int(len(text) / 1.6) + 1
 
     def execute(self, query: str, domains: List[str] | None = None) -> Dict[str, Any]:
         """执行本地检索管线（domains 为业务域过滤，None 表示全库）"""
@@ -214,11 +233,11 @@ class LocalRetrievalAgent:
             # 换成真实 PDF 后，一条法条普遍 600-900 字，被砍到 200 字就只剩半句，
             # 模型只能回答"信息在此处截断"。条数由 RERANK_TOP_K 控制，
             # 单条长度不该再被静默截断。
-            text_map[key] = r.get('text', '')[:1500]
+            text_map[key] = r.get('text', '')[:Config.MAX_CHUNK_CHARS]
         # BM25 这一路也要进 text_map，否则融合进来的块会变成"实体: xxx"的空文本
         for r in results.get('bm25_results', []):
             key = f"{r.get('doc_id', '')}||{r.get('chunk_index', 0)}"
-            text_map.setdefault(key, r.get('text', '')[:1500])
+            text_map.setdefault(key, r.get('text', '')[:Config.MAX_CHUNK_CHARS])
 
         # Step 3: 用真实文本填充 fused_results
         documents = []
@@ -232,13 +251,36 @@ class LocalRetrievalAgent:
                 'fusion_score': item.get('fusion_score', 0)
             })
 
-        # Step 4: Reranker 精排 → Top-3
+        # Step 4: 精排（只打分）→ 两处截断（候选池 + token 预算）
         if documents:
-            # 这里原来写死 top_k=3，Config.RERANK_TOP_K 定义了却没用上——
-            # 于是改 .env 完全不生效，永远只给模型 3 条证据。
-            # 实测后果："审批矩阵什么时候生效"的元数据块在向量里排第 4，
-            # 被这一行直接挤掉，模型只能回答"未包含生效日期"。
-            reranked = self.reranker.rerank(query, documents, top_k=Config.RERANK_TOP_K)
+            # ① rerank 前：候选池上限（成本保护，不是相关性判断）
+            pool = documents[:Config.RERANK_POOL]
+            reranked_all = self.reranker.rerank(query, pool)
+
+            # ② rerank 后：按 token 预算裁剪（上下文预算）
+            #    用 token 不用"固定条数"：一条法条 600-900 字、一块 FAQ 只有 50 字，
+            #    固定条数的上下文长度方差极大（实测 5 条可能 3000 字，也可能 4500 字）。
+            reranked, used_tokens, truncated = [], 0, 0
+            for d in reranked_all:
+                text = d.get('text', '') or d.get('chunk_text', '') or ''
+                # 单块上限：超长就截断并计数（法条被砍半句时能立刻发现）
+                if len(text) > Config.MAX_CHUNK_CHARS:
+                    text = text[:Config.MAX_CHUNK_CHARS]
+                    truncated += 1
+                t = self._count_tokens(text)
+                if used_tokens + t > Config.CONTEXT_TOKEN_BUDGET and reranked:
+                    break
+                reranked.append(d)
+                used_tokens += t
+                if len(reranked) >= Config.RERANK_TOP_K:
+                    break
+
+            logger.info(
+                f"[精排] 候选池 {len(documents)} → {len(pool)} → 送入 {len(reranked)} 条 | "
+                f"tokens={used_tokens}/{Config.CONTEXT_TOKEN_BUDGET} | "
+                f"超长截断 {truncated} 条 | "
+                f"top3 分数={[round(d.get('rerank_score', 0), 3) for d in reranked[:3]]}"
+            )
         else:
             reranked = []
 

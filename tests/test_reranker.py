@@ -114,8 +114,8 @@ def main():
                     'source': 'graph' if item.get('doc_id') == 'graph' else 'vector'
                 })
 
-            # ---- Reranker 重排 ----
-            reranked = reranker.rerank(query, documents, top_k=3)
+            # ---- Reranker 重排（只打分，截断在调用方做）----
+            reranked = reranker.rerank(query, documents)[:3]
             print(f"  重排结果: {len(reranked)} 条")
             for i, doc in enumerate(reranked, 1):
                 text_preview = doc.get('text', '')[:80].replace('\n', ' ')

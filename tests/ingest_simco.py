@@ -146,12 +146,23 @@ def main() -> int:
         print(f"\n[{doc_id}] {len(blocks)} 段")
         doc_triples = []
         for i, block in enumerate(blocks, 1):
-            try:
-                result = extractor.extract(block, chunk_id=f"{doc_id}#p{i}")
-            except Exception as e:  # noqa: BLE001
-                print(f"  段 {i} 抽取失败：{type(e).__name__}: {e}")
+            # 抽取是 LLM 调用，失败多半是限流/超时——带指数退避重试（1s→2s→4s）
+            got, err = None, None
+            for attempt in range(3):
+                try:
+                    got = extractor.extract(block, chunk_id=f"{doc_id}#p{i}").triples
+                    err = None
+                    break
+                except Exception as e:  # noqa: BLE001
+                    err = e
+                    if attempt < 2:
+                        delay = 1.0 * (2 ** attempt)
+                        print(f"  段 {i} 抽取失败（{type(e).__name__}），{delay:.0f}s 后重试 {attempt + 2}/3")
+                        time.sleep(delay)
+            if err is not None:
+                print(f"  段 {i} 抽取最终失败：{type(err).__name__}（已重试 3 次）")
                 continue
-            doc_triples.extend(result.triples)
+            doc_triples.extend(got)
 
         if doc_triples:
             stats = neo4j.batch_write(doc_triples)

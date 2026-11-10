@@ -26,6 +26,7 @@
 
 import argparse
 import bisect
+import time
 import os
 import re
 import sys
@@ -236,6 +237,77 @@ def _split_long(body: str, max_len: int) -> list[str]:
     return parts
 
 
+def extract_with_retry(extractor, text: str, chunk_id: str,
+                       attempts: int = 3, base_delay: float = 1.0):
+    """抽取（LLM 调用）带指数退避重试，返回 (三元组列表, 最后一次异常)。
+
+    为什么解析不重试、抽取要重试：
+        解析失败基本是文件坏了，重试也没用；
+        抽取是**网络 + LLM**，失败大多是限流/超时/临时 5xx，隔一两秒重试成功率很高。
+        按环节区分"该重试的"和"该放弃的"，比全局统一重试三次合理。
+    """
+    last_error = None
+    for i in range(attempts):
+        try:
+            return extractor.extract(text, chunk_id=chunk_id).triples, None
+        except Exception as e:  # noqa: BLE001
+            last_error = e
+            if i < attempts - 1:
+                delay = base_delay * (2 ** i)   # 1s → 2s → 4s
+                print(f"  {chunk_id} 抽取失败（{type(e).__name__}），{delay:.0f}s 后重试 {i + 2}/{attempts}")
+                time.sleep(delay)
+    return [], last_error
+
+
+def extract_docx(path: Path, pages=None):
+    """读 .docx：正文段落 + 表格 → (全文, 每段起始偏移, None)。
+
+    表格必须单独读：`Document.paragraphs` 拿不到表格内容，
+    这和 PDF 里 `get_text()` 丢表格是同一个坑（员工表 6 个数字全丢）。
+
+    .docx 没有"页"概念，page_nums 返回 None，
+    下游 `_page_of` 退化成"第几个段落块"，足够定位。
+    """
+    from docx import Document
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+
+    doc = Document(str(path))
+    parts, offsets = [], []
+    pos = 0
+
+    def push(block: str) -> None:
+        nonlocal pos
+        if not block:
+            return
+        offsets.append(pos)
+        parts.append(block)
+        pos += len(block) + 1
+
+    # 按 body 里的**原始顺序**遍历段落和表格。
+    # 不能先读全部 paragraphs 再读全部 tables：那样表格会被堆到文末，
+    # 和它所属的条款脱节（"第二条 交通费标准如下" 后面跟着的表跑到了最后）。
+    for child in doc.element.body.iterchildren():
+        tag = child.tag.rsplit("}", 1)[-1]
+        if tag == "p":
+            push(clean_text(Paragraph(child, doc).text))
+        elif tag == "tbl":
+            rows = []
+            for row in Table(child, doc).rows:
+                uniq = []
+                for cell in row.cells:
+                    c = clean_text(cell.text)
+                    # 合并单元格会重复同一个值，相邻去重
+                    if c and (not uniq or uniq[-1] != c):
+                        uniq.append(c)
+                if uniq:
+                    rows.append("：".join(uniq))
+            if rows:
+                push("\n".join(f"【表】{r}" for r in rows))
+
+    return "\n".join(parts), offsets, None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dir", default="data/pdf")
@@ -261,22 +333,28 @@ def main() -> int:
     d = Path(args.dir)
     # Windows 上 glob 大小写不敏感，同时用 "*.pdf" 和 "*.PDF" 会把同一批文件收两遍。
     # 统一按后缀小写过滤 + 去重。
-    files = sorted({p.resolve() for p in d.iterdir() if p.suffix.lower() == ".pdf"})
+    # 同时收 .docx：企业客户给的制度文件，docx 比 pdf 更常见（还在编辑的版本就是 docx）。
+    SUFFIXES = {".pdf", ".docx"}
+    files = sorted({p.resolve() for p in d.iterdir()
+                    if p.suffix.lower() in SUFFIXES and p.is_file()})
     files = [Path(p) for p in files]
     if args.only:
         wanted = {x.strip() for x in args.only.split(",") if x.strip()}
         files = [f for f in files if f.name in wanted]
     if not files:
-        print(f"[FAIL] {d} 下没有 PDF")
+        print(f"[FAIL] {d} 下没有 PDF / DOCX")
         return 1
 
     # ---------- 解析 ----------
     all_chunks = []
     print("=" * 70)
-    print(f"解析 {len(files)} 份 PDF")
+    print(f"解析 {len(files)} 份文档")
     print("=" * 70)
     for f in files:
-        text, offsets, page_nums = extract_pdf(f, pages)
+        if f.suffix.lower() == ".docx":
+            text, offsets, page_nums = extract_docx(f)
+        else:
+            text, offsets, page_nums = extract_pdf(f, pages)
         title = title_of(f, text)
         chunks = split_clauses(text, offsets, title, page_nums=page_nums)
         all_chunks.append((f.stem, chunks))
@@ -329,13 +407,15 @@ def main() -> int:
         store.load_if_needed()
 
     offset = 0
+    failed_chunks = []
     for stem, chunks in all_chunks:
         triples = []
         for i, c in enumerate(chunks, 1):
-            try:
-                triples.extend(extractor.extract(c["text"], chunk_id=f"{stem}#{c['article']}").triples)
-            except Exception as e:  # noqa: BLE001
-                print(f"  {stem} {c['article']} 抽取失败：{type(e).__name__}")
+            got, err = extract_with_retry(extractor, c["text"], f"{stem}#{c['article']}")
+            if err is not None:
+                failed_chunks.append(f"{stem}#{c['article']}")
+                print(f"  {stem} {c['article']} 抽取最终失败：{type(err).__name__}（已重试 3 次）")
+            triples.extend(got)
         written = neo4j.batch_write(triples).get("success", 0) if triples else 0
         print(f"  {stem}: {len(triples)} 条三元组，写入 {written}")
 
@@ -349,6 +429,10 @@ def main() -> int:
         nodes = s.run("MATCH (n) RETURN count(n) AS c").single()["c"]
         rels = s.run("MATCH ()-[r]->() RETURN count(r) AS c").single()["c"]
     print(f"完成：Neo4j {nodes} 节点 / {rels} 关系" + (f"，向量累计 {offset} 块" if store else ""))
+    if failed_chunks:
+        print(f"[WARN] {len(failed_chunks)} 个块抽取最终失败（已重试 3 次），未进图：")
+        for name in failed_chunks[:10]:
+            print(f"       - {name}")
     print("=" * 70)
 
     neo4j.close()

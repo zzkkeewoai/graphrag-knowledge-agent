@@ -1,9 +1,16 @@
 import logging
+import os
 from typing import List, Dict, Any
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
 logger = logging.getLogger(__name__)
+
+# 默认用中文向量模型。
+# 原来写死 all-MiniLM-L6-v2（英文模型），中文查询会被编码成近乎相同的向量——
+# 实测两个完全不同的中文问题余弦相似度 > 0.92，既导致向量检索乱召回，
+# 又导致语义缓存把 A 问题的答案返回给 B 问题。
+DEFAULT_EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-zh-v1.5")
 
 
 class BGEReranker:
@@ -13,15 +20,18 @@ class BGEReranker:
     为什么不用 CrossEncoder（如 bge-reranker-v2-m3）？
     - bge-reranker-v2-m3 需 2.2GB 内存，8GB 机器上会 OOM/Segfault
     - base 版也要 ~1.1GB 且需从 HF 下载，耗时很长
-    - 用已有的 MiniLM 模型做 bi-encoder 重排，零额外开销，效果足够用
+    - 用已有的 embedding 模型做 bi-encoder 重排，零额外开销
 
     为什么用 Reranker（精排）？
     - 向量检索（双塔模型）快速但粗糙
     - 用 Reranker 在最后一步做"精排"，弥补粗排的精度不足
+
+    注意：它和向量库必须用**同一个**模型，否则查询向量和库里的向量
+    不在同一空间，相似度没有意义。所以两者都读 EMBEDDING_MODEL。
     """
 
-    def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
-        """复用轻量 embedding 模型，384维，已缓存在本地"""
+    def __init__(self, model_name: str | None = None):
+        model_name = model_name or DEFAULT_EMBEDDING_MODEL
         logger.info(f"加载 Reranker embedding 模型: {model_name}")
         self.model = SentenceTransformer(model_name)
         logger.info("Reranker 模型加载完成")

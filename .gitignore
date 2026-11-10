@@ -29,3 +29,29 @@ neo4j_logs/
 etcd_data/
 minio_data/
 data/*.json
+
+# 评测产物：每次跑都生成一批，不该进版本库
+runs/
+logs/
+*.log
+
+# 向量库：由 ingest 生成（.npy 是二进制，换 embedding 模型还会变维度）
+data/local_vectors/
+
+# 大体积源文件：可重新下载的公开 PDF（链接见 docs/完整记录 阶段十二）
+data/pdf_extra/*.pdf
+
+# 个人材料：简历、面试准备，不入公开仓库
+docs/简历*
+docs/面试*
+docs/102题答案.md
+docs/高频题型分布.md
+docs/中小厂面试重点.md
+docs/三项目学习手册.md
+docs/*学习手册.md
+docs/项目一深讲*
+docs/项目一踩坑实录.md
+docs/项目一完整叙事.md
+docs/第4步-简历与JD缺口.md
+logs/uvicorn.log
+docs/项目一深挖*

@@ -23,7 +23,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 from src.config import Config  # noqa: E402
 from src.database.neo4j_client import Neo4jClient  # noqa: E402
-from src.database.milvus_client import MilvusClient  # noqa: E402
+from src.database.local_vector_store import LocalVectorStore  # 与 api.py 保持一致：不依赖 Milvus 容器
 from src.schemas.graph_schema import EntityType, RelationType, Triple  # noqa: E402
 
 COLLECTION = "document_chunks"
@@ -87,7 +87,7 @@ def main() -> None:
     print("=" * 60)
     print("写入 Milvus 文档块")
     print("=" * 60)
-    milvus = MilvusClient(host=Config.MILVUS_HOST, port=Config.MILVUS_PORT)
+    milvus = LocalVectorStore()
     milvus.connect()
     # 存在则复用（drop_existing=False 防止误删数据）
     milvus.create_collection(COLLECTION, drop_existing=False)

@@ -1,0 +1,20 @@
+{"id":"w01","category":"单跳","query":"公司下设几个事业部？","expect":{"all":[["4","四"]],"none":[]},"note":"org：四个事业部"}
+{"id":"w02","category":"单跳","query":"法务部负责哪些工作？","expect":{"all":[["合同审核"]],"none":[]},"note":"org 第2节"}
+{"id":"w03","category":"单跳","query":"采购部日常对接哪个系统？","expect":{"all":[["SRM"]],"none":[]},"note":"org 第2节"}
+{"id":"w04","category":"单跳","query":"OA 系统主要用于什么？","expect":{"all":[["公文流转","报销","出差"]],"none":[]},"note":"systems 第1节"}
+{"id":"w05","category":"单跳","query":"ERP 系统用于哪些业务？","expect":{"all":[["采购订单","库存","财务核算"]],"none":[]},"note":"systems 第1节，三项都要"}
+{"id":"w06","category":"单跳","query":"采购金额达到50万元及以上，由谁审批？","expect":{"all":[["总经理"]],"none":[]},"note":"2.3条"}
+{"id":"w07","category":"单跳","query":"单笔借款金额的上限是多少？","expect":{"all":[["2万"]],"none":[]},"note":"4.4条"}
+{"id":"w08","category":"单跳","query":"国内出差预计费用达到5000元，由谁审批？","expect":{"all":[["分管副总"]],"none":[]},"note":"5.2条"}
+{"id":"w09","category":"单跳","query":"内部数据包括哪些内容？","expect":{"all":[["部门职责","业务流程"]],"none":[]},"note":"permissions 第1节"}
+{"id":"w10","category":"单跳","query":"绩效结果哪些人可以查看？","expect":{"all":[["直属主管"],["人力资源部"]],"none":[]},"note":"permissions 第3节"}
+{"id":"w11","category":"多跳","query":"紧急采购来不及事前审批时，可以怎么处理？","expect":{"all":[["口头"]],"none":[]},"note":"6.1条"}
+{"id":"w12","category":"多跳","query":"一名员工转岗，他的系统权限由谁负责回收、多久内完成？","expect":{"all":[["信息技术部"],["3个工作日","三个工作日"]],"none":[]},"note":"permissions 第4节：两个点都要"}
+{"id":"w13","category":"多跳","query":"采购一台80万元的设备，审批要经过哪些人？","expect":{"all":[["部门负责人"],["财务总监"],["总经理"]],"none":[]},"note":"2.3条 + 数值区间推理"}
+{"id":"w14","category":"多跳","query":"财务部要新增一个系统权限，需要谁审批？","expect":{"all":[["直属主管"],["部门负责人"]],"none":[]},"note":"permissions 第4节"}
+{"id":"w15","category":"多跳","query":"销售部签订的合同，合同条款和客户档案分别谁能看？","expect":{"all":[["财务部"]],"none":[]},"note":"合同条款：采购部与财务部；客户档案：销售部与售后"}
+{"id":"w16","category":"单跳","query":"公司员工大约有多少人？","expect":{"all":[["1200","一千二"]],"none":[]},"note":"org 第1节"}
+{"id":"w17","category":"单跳","query":"MES 系统用于什么？","expect":{"all":[["工单","报工"]],"none":[]},"note":"systems 第1节"}
+{"id":"w18","category":"单跳","query":"公司的设备供应商有哪几家？","expect":{"all":[["精测"],["恒信"]],"none":[]},"note":"org 第5节"}
+{"id":"w19","category":"拒答","query":"公司提供员工宿舍吗？","expect":{"all":[],"none":[]},"note":"知识库没有宿舍规定"}
+{"id":"w20","category":"拒答","query":"公司的股权激励计划具体怎么分配？","expect":{"all":[],"none":[]},"note":"只在密级里提到股权激励信息，没有分配方案"}

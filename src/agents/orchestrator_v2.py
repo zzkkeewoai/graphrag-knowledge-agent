@@ -39,6 +39,12 @@ class AgentState(TypedDict):
     query: str
     history: NotRequired[List[Dict[str, str]]]
 
+    # 业务域过滤（多域共存时防串味）。
+    # 必须在这里声明：LangGraph 按 TypedDict 的字段建 channel，
+    # 没声明的键在 invoke 时会被丢掉——实测表现为"API 传了 domain，
+    # 但 state['domains'] 永远是 None"，检索照样混检，串味不变。
+    domains: NotRequired[List[str]]
+
     # 路由
     route: str                                    # "local" | "global"
 
@@ -105,8 +111,13 @@ class RouterAgent:
         # 扩展关键词列表
         self.global_keywords = [
             "总结", "对比", "概述", "异同", "分析", "趋势",
-            "所有", "整体", "全局", "概况", "汇总", "统计",
-            "列出全部", "一共有多少", "有哪些项目"
+            "所有", "整体", "全局", "概况", "汇总",
+            # 这里**不能放「统计」和「一共有多少」**。在企业制度/年报语料里，
+            # 它们绝大多数是"查一个具体数字"（"在职员工一共有多少名"→ 年报员工表里就有），
+            # 而不是"对整个库做汇总"。实测这两个词把两道本可单条命中的题
+            # 误判成 global，global 只走社区摘要，结果答成"知识库中没有相关规定"。
+            # 真正的聚合意图由「总结/汇总/概况/所有」覆盖。
+            "列出全部", "有哪些项目"
         ]
         self.local_keywords = [
             "是什么", "谁", "什么时候", "哪些", "如何",
@@ -183,12 +194,14 @@ class LocalRetrievalAgent:
         self.retriever = retriever
         self.reranker = reranker
 
-    def execute(self, query: str) -> Dict[str, Any]:
-        """执行本地检索管线"""
-        logger.info(f"[LocalAgent] 检索: {query[:50]}...")
+    def execute(self, query: str, domains: List[str] | None = None) -> Dict[str, Any]:
+        """执行本地检索管线（domains 为业务域过滤，None 表示全库）"""
+        logger.info(f"[LocalAgent] 检索: {query[:50]}... (domains={domains})")
 
         # Step 1: 混合检索
-        results = self.retriever.retrieve(query)
+        # 这里原来用默认 top_k=5，Config.VECTOR_TOP_K 形同虚设。
+        # 后果：向量只召回 5 条，含答案的块排第 4 也可能被图谱结果挤出融合窗口。
+        results = self.retriever.retrieve(query, top_k=Config.VECTOR_TOP_K, domains=domains)
 
         # Step 2: text_map（融合结果 → 原文）
         text_map = {}
@@ -197,7 +210,15 @@ class LocalRetrievalAgent:
             text_map[key] = r.get('text', '')
         for r in results.get('vector_results', []):
             key = f"{r.get('doc_id', '')}||{r.get('chunk_index', 0)}"
-            text_map[key] = r.get('text', '')[:200]
+            # 原来写死 [:200]：短文档（一句话一块）时看不出问题，
+            # 换成真实 PDF 后，一条法条普遍 600-900 字，被砍到 200 字就只剩半句，
+            # 模型只能回答"信息在此处截断"。条数由 RERANK_TOP_K 控制，
+            # 单条长度不该再被静默截断。
+            text_map[key] = r.get('text', '')[:1500]
+        # BM25 这一路也要进 text_map，否则融合进来的块会变成"实体: xxx"的空文本
+        for r in results.get('bm25_results', []):
+            key = f"{r.get('doc_id', '')}||{r.get('chunk_index', 0)}"
+            text_map.setdefault(key, r.get('text', '')[:1500])
 
         # Step 3: 用真实文本填充 fused_results
         documents = []
@@ -213,7 +234,11 @@ class LocalRetrievalAgent:
 
         # Step 4: Reranker 精排 → Top-3
         if documents:
-            reranked = self.reranker.rerank(query, documents, top_k=3)
+            # 这里原来写死 top_k=3，Config.RERANK_TOP_K 定义了却没用上——
+            # 于是改 .env 完全不生效，永远只给模型 3 条证据。
+            # 实测后果："审批矩阵什么时候生效"的元数据块在向量里排第 4，
+            # 被这一行直接挤掉，模型只能回答"未包含生效日期"。
+            reranked = self.reranker.rerank(query, documents, top_k=Config.RERANK_TOP_K)
         else:
             reranked = []
 
@@ -343,7 +368,10 @@ class AnswerAgent:
         """LLM 生成（多 provider 热备；全部失败时由调用方降级为模板）"""
         if result["type"] == "local":
             docs = result.get("documents", [])
-            context = "\n".join([f"- {d.get('text', '')}" for d in docs[:5]])
+            # 这里原来写死 docs[:5]，精排给 8 条、prompt 只取 5 条，
+            # 于是把 RERANK_TOP_K 从 6 调到 8 完全没用（document_count 涨了，
+            # 进 prompt 的永远还是 5 条）。条数应由 RERANK_TOP_K 统一控制。
+            context = "\n".join([f"- {d.get('text', '')}" for d in docs])
             prompt = (
                 f"仅根据以下信息回答用户问题。如果信息不足，请明确说明。\n\n"
                 f"用户问题: {query}\n\n"
@@ -351,10 +379,15 @@ class AnswerAgent:
             )
         else:
             context = result.get("context", "")
+            # 原来这里只写"根据以下全局分析总结回答"，没有边界约束。
+            # 后果：问"年终奖发几个月"，全局检索拿到一点模糊内容后，模型直接用
+            # 通用常识补全（"互联网 1-3 个月、金融 3-12 个月…"）——那是幻觉。
+            # 对知识库助手来说，**编答案比拒答严重得多**，所以这里必须把边界写死。
             prompt = (
-                f"根据以下全局分析总结回答用户问题。\n\n"
+                f"仅根据以下资料回答用户问题，禁止使用资料以外的通用常识补充。\n"
+                f"如果资料中没有相关内容，直接回答「知识库中没有相关规定」，不要推测。\n\n"
                 f"用户问题: {query}\n\n"
-                f"全局信息:\n{context}"
+                f"资料:\n{context}"
             )
 
         # 交给 ProviderManager：内部按优先级尝试，失败自动切换下一个 provider
@@ -488,7 +521,7 @@ def create_orchestrator_graph(
         for attempt in range(max_retries):
             try:
                 with tracer.start_span("local_retrieval", attempt=attempt + 1) as span:
-                    result = local_agent.execute(query)
+                    result = local_agent.execute(query, domains=state.get("domains"))
                     span.set_attribute("document_count", len(result.get("documents", [])))
 
                     state["documents"] = result.get("documents", [])
@@ -940,9 +973,11 @@ class AgentOrchestratorV2:
         else:
             self.cache = None
 
-    def process(self, query: str) -> Dict[str, Any]:
+    def process(self, query: str, domains: List[str] | None = None) -> Dict[str, Any]:
         """
         处理用户查询（兼容旧接口）
+
+        domains: 只在该业务域内检索（None = 全库）。多域共存时用它防止串味。
 
         执行流程（LangGraph 状态机约束）:
           ① router → ② local/global → ③ answer → 返回
@@ -958,6 +993,7 @@ class AgentOrchestratorV2:
         # 初始化状态
         initial_state: AgentState = {
             "query": query,
+            "domains": domains,
             "route": "local",
             "step_count": 0,
             "max_steps": 15,

@@ -1,0 +1,15 @@
+{"id": "single_001", "category": "单跳", "query": "A项目使用了哪些技术？", "expect": {"all": [["Python"], ["Neo4j"]], "none": []}, "note": "A项目使用Python和Neo4j"}
+{"id": "single_002", "category": "单跳", "query": "谁领导了A项目？", "expect": {"all": [["张伟"]], "none": []}, "note": "张伟领导A项目"}
+{"id": "single_003", "category": "单跳", "query": "B项目依赖哪些技术？", "expect": {"all": [["Java"], ["SpringBoot"]], "none": []}, "note": "B项目依赖Java和Spring Boot"}
+{"id": "single_004", "category": "单跳", "query": "张伟属于哪个部门？", "expect": {"all": [["技术部"]], "none": []}, "note": "张伟属于技术部"}
+{"id": "single_005", "category": "单跳", "query": "A项目预计什么时候上线？", "expect": {"all": [["12月"]], "none": []}, "note": "A项目预计12月上线"}
+{"id": "multi_001", "category": "多跳推理查询", "query": "张伟领导的项目使用了哪些技术？", "expect": {"all": [], "none": []}, "manual": true, "note": "张伟领导A项目，A项目使用Python和Neo4j"}
+{"id": "multi_002", "category": "多跳推理查询", "query": "与A项目使用相同技术的项目有哪些？", "expect": {"all": [], "none": []}, "manual": true, "note": "需要查找使用Python或Neo4j的其他项目"}
+{"id": "multi_003", "category": "多跳推理查询", "query": "技术部的人员领导了哪些项目？这些项目各用了什么技术？", "expect": {"all": [], "none": []}, "manual": true, "note": "技术部张伟领导A项目（使用Python、Neo4j）"}
+{"id": "multi_004", "category": "多跳推理查询", "query": "B项目依赖的技术中，哪些也是A项目使用的？", "expect": {"all": [], "none": []}, "manual": true, "note": "对比A项目使用和B项目依赖的技术栈交集"}
+{"id": "multi_005", "category": "多跳推理查询", "query": "12月上线的项目中涉及哪些技术？这些技术有依赖关系吗？", "expect": {"all": [], "none": []}, "manual": true, "note": "A项目12月上线，使用Python和Neo4j"}
+{"id": "global_001", "category": "全局对比分析", "query": "总结一下所有项目使用的技术栈", "expect": {"all": [], "none": []}, "manual": true, "note": "A项目使用Python和Neo4j，B项目依赖Java和Spring Boot"}
+{"id": "global_002", "category": "全局对比分析", "query": "对比A项目和B项目在技术选型上的异同", "expect": {"all": [], "none": []}, "manual": true, "note": "A项目使用Python生态，B项目依赖Java生态；两者都涉及企业级框架"}
+{"id": "global_003", "category": "全局对比分析", "query": "所有项目中，哪些技术被多个项目共同使用或依赖？", "expect": {"all": [], "none": []}, "manual": true, "note": "需要全局分析技术栈的跨项目使用情况"}
+{"id": "global_004", "category": "全局对比分析", "query": "整体来看，这些项目的技术趋势是什么？", "expect": {"all": [], "none": []}, "manual": true, "note": "以Python和Java为主流，涉及数据库、框架等企业级技术"}
+{"id": "global_005", "category": "全局对比分析", "query": "整个团队的人力分布和技术覆盖情况如何？", "expect": {"all": [], "none": []}, "manual": true, "note": "张伟（技术部）领导A项目；需全局分析人员和项目分布"}

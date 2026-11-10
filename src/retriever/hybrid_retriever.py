@@ -1,17 +1,73 @@
 import logging
+import os
+import re
 from typing import List, Dict, Any
 from src.database.neo4j_client import Neo4jClient
 from src.database.milvus_client import MilvusClient
+from src.retriever.bm25_index import BM25Index
 
 logger = logging.getLogger(__name__)
 
 
 class HybridRetriever:
-    """混合检索器：结合图谱检索 + 向量检索"""
+    """混合检索器：图谱 + 向量 + BM25 三路召回，RRF 融合。
+
+    为什么加 BM25：向量擅长语义相近，但对精确术语不敏感——"第十五条""净资产 50%"
+    这种字面唯一的片段，倒排索引往往比 embedding 更准。企业制度/年报里全是这类表述。
+
+    可用 USE_BM25=false 关闭这一路，用于做 A/B 对照。
+    """
 
     def __init__(self, neo4j_client: Neo4jClient, milvus_client: MilvusClient):
         self.neo4j = neo4j_client
         self.milvus = milvus_client
+        self._bm25: BM25Index | None = None
+        self._entity_domains = None      # 实体→域 的懒加载映射（图谱层过滤用）
+
+    def _entity_domain_map(self):
+        """懒构建"实体→域"映射：用各域块文本反推实体归属。
+
+        图里没有 source_chunk，没法直接回填；重灌要 400+ 次抽取调用。
+        块文本里有原文，反推零成本——代价是近似（见 entity_domain.py 的说明）。
+        """
+        if self._entity_domains is None:
+            from src.retriever.domain import domain_of
+            from src.retriever.entity_domain import EntityDomainMap
+
+            by_domain: dict[str, list[str]] = {}
+            titles_by_domain: dict[str, list[str]] = {}
+            for text, meta in zip(self.milvus.texts, self.milvus.metas):
+                doc = domain_of(meta["doc_id"])
+                by_domain.setdefault(doc, []).append(text)
+                # doc_id 去掉序号前缀就是文档标题（"1_对外担保管理制度" → "对外担保管理制度"）
+                title = re.sub(r"^\d+[_\-\s]+", "", meta["doc_id"])
+                if len(title) >= 4:
+                    titles_by_domain.setdefault(doc, [])
+                    if title not in titles_by_domain[doc]:
+                        titles_by_domain[doc].append(title)
+
+            names = []
+            try:
+                with self.neo4j.driver.session() as s:
+                    names = [r["n"] for r in s.run("MATCH (n:Entity) RETURN n.name AS n")]
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"取实体名失败，图谱层不做域过滤: {e}")
+
+            self._entity_domains = EntityDomainMap().build(names, by_domain, titles_by_domain)
+        return self._entity_domains
+
+    def _bm25_retrieve(self, query: str, top_k: int) -> List[Dict]:
+        """BM25 一路。懒构建索引：第一次查询时才建，避免启动变慢。"""
+        if os.getenv("USE_BM25", "true").lower() != "true":
+            return []
+        try:
+            if self._bm25 is None:
+                self._bm25 = BM25Index.from_vector_store(self.milvus)
+            return self._bm25.search(query, top_k)
+        except Exception as e:  # noqa: BLE001
+            # BM25 挂了不能影响主链路
+            logger.warning(f"BM25 检索失败，本次跳过该路: {e}")
+            return []
 
     def reciprocal_rank_fusion(self, results_list: List[List[Dict]], k: int = 60) -> List[Dict]:
         """
@@ -33,8 +89,14 @@ class HybridRetriever:
         sorted_items = sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
         # 返回前N个结果
+        # 注意：原来这里写死 [:5]，Config.FUSION_TOP_K（=8）形同虚设。
+        # 加了第三路（BM25）之后这个问题被放大：三路各 8 条竞争 5 个位置，
+        # 融合窗口越小，越容易把原文挤掉。
+        from src.config import Config
+
+        limit = max(5, getattr(Config, "FUSION_TOP_K", 8))
         fused_results = []
-        for key, score in sorted_items[:5]:
+        for key, score in sorted_items[:limit]:
             # 用 rsplit 从右边拆，保留 doc_id 中的 _
             parts = key.rsplit('||', 1)
             if len(parts) == 2:
@@ -47,32 +109,98 @@ class HybridRetriever:
                 })
         return fused_results
 
-    def retrieve(self, query: str, top_k: int = 5, hops: int = 2) -> Dict[str, Any]:
-        """
-        混合检索主流程
+    def retrieve(self, query: str, top_k: int = 5, hops: int = 2,
+                 domains: List[str] | None = None) -> Dict[str, Any]:
+        """混合检索主流程。
 
         Args:
             query: 用户查询
             top_k: 向量检索返回条数
             hops: 图谱多跳扩展深度（默认 2，支持依赖链/跨实体对比查询）
+            domains: 只在这些域里检索（如 ["pdf"] / ["simco","project"]）；
+                     为 None 时不过滤——多域混检，噪声会互相挤占
         """
-        logger.info(f"混合检索: '{query}' (hops={hops})")
+        from src.retriever.domain import keep
+
+        logger.info(f"混合检索: '{query}' (hops={hops}, domains={domains})")
+
+        # 有域过滤时多取一些候选，过滤后再截断，避免"取 5 条过滤完只剩 1 条"
+        fetch_k = top_k * 4 if domains else top_k
 
         # 1. 图谱检索（从Neo4j获取相关实体 + 多跳邻居）
         graph_results = self._graph_retrieve(query, hops=hops)
-        logger.info(f"图谱检索: {len(graph_results)} 个结果 (hops={hops})")
+        if domains and graph_results:
+            # 图谱层也要过滤，否则向量层隔开了、图谱层还是通的（实测串味的根因）。
+            # 用三元组级判断：主语常是"公司"这种通用词，真正带域信息的是宾语。
+            emap = self._entity_domain_map()
+            before = len(graph_results)
+            graph_results = [
+                r for r in graph_results
+                if emap.triple_keep(r.get("entity", ""), r.get("target", ""), domains)
+            ]
+            logger.info(f"图谱检索: {before} → {len(graph_results)} 个结果（域过滤后）")
+        else:
+            logger.info(f"图谱检索: {len(graph_results)} 个结果 (hops={hops})")
 
         # 2. 向量检索（从Milvus获取相关文档块）
-        vector_results = self._vector_retrieve(query, top_k)
-        logger.info(f"向量检索: {len(vector_results)} 个结果")
+        vector_results = self._vector_retrieve(query, fetch_k)
+        if domains:
+            vector_results = [r for r in vector_results if keep(r.get("doc_id", ""), domains)][:top_k]
+        logger.info(f"向量检索: {len(vector_results)} 个结果（域过滤后）")
 
-        # 3. RRF融合
-        fused = self.reciprocal_rank_fusion([graph_results, vector_results])
+        # 2.5 BM25 关键词检索（精确术语靠它，向量对"第十五条""50%"这类不敏感）
+        bm25_results = self._bm25_retrieve(query, fetch_k)
+        if domains:
+            bm25_results = [r for r in bm25_results if keep(r.get("doc_id", ""), domains)][:top_k]
+        logger.info(f"BM25检索: {len(bm25_results)} 个结果（域过滤后）")
+
+        # 3. RRF融合（三路）
+        fused = self.reciprocal_rank_fusion([graph_results, vector_results, bm25_results])
         logger.info(f"RRF融合: {len(fused)} 个结果")
+
+        # 3.5 【融合保底配额】
+        # RRF 只看排名不看来源，而图谱一路结果数量通常远多于向量一路，
+        # 于是向量结果被整体挤出窗口——表现是"文本里明明有答案，模型却说没有"。
+        # 实测两个例子：含"1200人"的块向量排第 4、含"事业部"的排第 10，
+        # 都没进最终上下文；前者答案就在原文里。
+        #
+        # 这里强制保留向量前 2 名：宁可多给两条文档，也不能让原文缺席。
+        # 精排（rerank）之后仍然按相关性收敛，不会真的把噪声全塞给模型。
+        if vector_results:
+            fused_keys = {(f.get("doc_id"), f.get("chunk_index")) for f in fused}
+            added = 0
+            # 向量召回本身只有 VECTOR_TOP_K 条（目前 5），**全部保留**，不参与淘汰。
+            # 原因：图谱一路动辄返回几十上百条（实测 90 条），RRF 只看排名不看来源，
+            # 几条向量结果很容易被整体挤出窗口 —— 而向量是唯一带原文的一路。
+            # 早先版本只补"未入选的前 2 条"，实测第 5 名的原文块仍然会丢
+            # （"A项目使用Python"就排第 5），所以这里放开到全量。
+            for v in vector_results:
+                key = (v.get("doc_id"), v.get("chunk_index"))
+                if key not in fused_keys:
+                    fused.append({**v, "fusion_score": 0.0})
+                    fused_keys.add(key)
+                    added += 1
+            if added:
+                logger.info(f"[保底] 补入 {added} 条向量结果，防止原文被图谱挤出")
+
+        # 3.6 【BM25 保底】同理：BM25 前 2 名代表的往往是最精确的字面命中，
+        # 被图谱的海量结果挤掉就白搭了。
+        if bm25_results:
+            fused_keys = {(f.get("doc_id"), f.get("chunk_index")) for f in fused}
+            added = 0
+            for b in bm25_results[:2]:
+                key = (b.get("doc_id"), b.get("chunk_index"))
+                if key not in fused_keys:
+                    fused.append({**b, "fusion_score": 0.0})
+                    fused_keys.add(key)
+                    added += 1
+            if added:
+                logger.info(f"[保底] 补入 {added} 条 BM25 结果")
 
         return {
             "graph_results": graph_results,
             "vector_results": vector_results,
+            "bm25_results": bm25_results,
             "fused_results": fused,
             "query": query
         }

@@ -5,6 +5,10 @@
 > **一句话定位**：检索到相关内容 ≠ 能回答你的问题——用确定性规则验证证据是否足以支撑结论，不足就补召回、仍不足就**拒答**；图谱与文本冲突时按时间/来源/置信度裁决。
 > **v2.3 重点**：FastAPI 服务层 · SSE 流式输出 · Prometheus 语义化指标 · Redis 分布式语义缓存 · 多 Provider 热备 · 压测数据（P95 64ms / 27 RPS）
 
+> **企业域扩展（2026-11）**：在原项目域之外新增**企业制度域**（10 篇制度文档 / 14 实体 / 15 关系），并建成 **105 题六套评测**（调优 20 / 开发 20 / 验收 20 / 新语料 20 / 跨文档多跳 10 / 原域回归 15）。
+> 跨文档多跳 10/10；语料扩至 10 篇后旧题无退化。
+> **完整过程与踩坑记录**：[`docs/完整记录-2026-11-04.md`](docs/完整记录-2026-11-04.md) · 评测报告：[`reports/2026-11-04-simco-eval.md`](reports/2026-11-04-simco-eval.md)
+
 ---
 
 ## 系统架构
@@ -244,7 +248,40 @@ python tests/sanity_check_providers.py      # 多 Provider 热备（故障切换
 python tests/api_check.py                   # 服务接口四场景（需服务已启动）
 python tests/evaluation/run_evaluation.py   # Evaluation 闭环
 python tests/manual_agent_demo.py           # 手工端到端演示（需 Neo4j/Milvus）
+
+# —— 企业域（2026-11 新增）——
+python tests/demo.py                        # 30 秒演示：数值定位 / 跨文档多跳 / 权限边界 / 拒答
+python tests/run_all.py                     # 一键跑全部评测集（需服务已启动）
+python tests/test_static.py                 # 静态检查 40 项（无外部依赖，CI 跑这个）
+python tests/ingest_simco.py --reset        # 灌企业域语料（图 + 向量）
+python tests/ingest_simco.py --dir data/project  # 追加项目域，验证多域共存
+python tests/check_graph.py                 # 图结构 / 再化连通 / 两跳可达
+python tests/debug_retrieval.py "查询" --top 5 --contains 关键词  # 召回诊断
+python tests/debug_fusion.py "查询" --needle 关键词              # 三路召回对比
+
+# —— 真实 PDF 语料（2026-11 新增）——
+python tests/ingest_pdf.py --reset          # 解析 data/pdf/*.pdf → 条款级切块 → 灌库
+python tests/ingest_pdf.py --dir data/pdf_extra --pages 51-53   # 只取年报的指定页
+python tests/ingest_pdf.py --dry-run        # 只解析不灌库，看切块统计
+python tests/run_eval.py --file datasets/weijin40.jsonl      # 真实制度 40 题
+python tests/run_eval.py --file datasets/weijin48_kouyu.jsonl # 同一批题的口语版
+python tests/ab_retrieval.py                # 检索层 A/B：BM25 开/关
 ```
+
+**两套语料只能同时存在一套**（`--reset` 会清库）：
+`ingest_simco`（手写制度 + 项目域，配 simco_eval/holdout/project15）与
+`ingest_pdf`（真实 PDF，配 weijin40/weijin_hr/kouyu）。
+
+---
+
+## 文档索引（2026-11 改造全过程）
+
+| 文档 | 内容 |
+|---|---|
+| [`docs/完整记录-2026-11-04.md`](docs/完整记录-2026-11-04.md) | 82 步改造全过程：为什么改、怎么改、怎么验证 |
+| [`docs/测试手册.md`](docs/测试手册.md) | 起服务、自己提问、10 个可试问题、排查顺序 |
+| [`docs/线上评测方案.md`](docs/线上评测方案.md) | 三层评测、影子流量、北极星与护栏、样本量 |
+| [`reports/2026-11-04-simco-eval.md`](reports/2026-11-04-simco-eval.md) | 评测报告：13 个问题的因果表 |
 
 ---
 

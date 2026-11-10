@@ -22,6 +22,7 @@ evidence_validator.py —— 证据验证器（v2.2 新增）
   3. 最小侵入：不改变 HybridRetriever / RRF / Reranker 的任何逻辑。
 """
 import logging
+import os
 import re
 from typing import Dict, Any, List, Optional
 
@@ -242,6 +243,36 @@ class EvidenceValidator:
             f"[Evidence] relation={target_relation} entity={target_entity} "
             f"graph_results={len(graph_results or [])} targeted_retried={targeted_retried}"
         )
+
+        # 【相关性兜底：用检索置信度代替字面实体匹配】
+        # 原来的实体匹配对中文太脆弱："薪酬发放用哪个系统"里的实体抽不出来，
+        # 证据明明在第一条，仍被判 insufficient 直接拒答。
+        #
+        # 阈值必须**按提问分布标定**，不能拍一个数。实测扫描（weijin48_kouyu 口语集）：
+        #   0.55 → 口语 39/48（81%）   书面 48/48
+        #   0.45 → 口语 44/48（92%）
+        #   0.40 → 口语 47/48（98%）   书面 48/48，且"今天天气"（0.32）仍被拒
+        # 0.40 既救回口语题，又保留了对无关问题的拒答能力。
+        #
+        # 为什么口语需要更低的阈值：口语与法条的字面差异大，embedding 分数整体偏低
+        # （"生产线上有多少人" top1=0.475），用书面语标定的阈值会**系统性拒答**。
+        # 换语料或换 embedding 模型必须重跑这个扫描。
+        min_score = float(os.getenv("EVIDENCE_MIN_SCORE", "0.40"))
+        best = max((d.get("rerank_score") or 0) for d in documents) if documents else 0.0
+        if best >= min_score:
+            logger.info(f"[Evidence] 检索最高分 {best:.3f} ≥ {min_score}，判定 sufficient")
+            return self._sufficient(query, target_relation, target_entity)
+
+        # 【数值/区间类问题的例外】
+        # 证据里写的是"50 万元及以上"，而问题问的是"60 万元"——字面永远匹配不上，
+        # 于是被判 insufficient 并直接拒答。实测这是"带金额的多跳题全挂"的唯一原因：
+        # 检索明明拿到了第 2.1-2.4 条（含"总经理"），却因为"60万"不在原文而拒答。
+        #
+        # 尺寸拿捏：这里只是**不再提前拦掉**，并没有放宽生成阶段——
+        # 生成 prompt 里已有"信息不足请明确说明"的约束，所以不会凭空编答案。
+        if re.search(r"\d+\s*(万|元|天|日|小时|个工作日|%)", query) and documents:
+            logger.info("[Evidence] 数值/区间类问题，跳过字面实体匹配")
+            return self._sufficient(query, target_relation, target_entity)
 
         # 无目标关系：退化为"有没有检索到内容"
         if not target_relation:

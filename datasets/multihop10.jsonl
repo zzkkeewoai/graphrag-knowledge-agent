@@ -1,0 +1,10 @@
+{"id":"mh01","category":"跨文档多跳","query":"采购一台25万元的设备，采购方式是什么，付款由谁审批？","expect":{"all":[["招标"],["财务总监"]],"none":[]},"note":"procurement 2.3（20万以上公开招标）+ approval_matrix 2.2（5-50万财务总监）"}
+{"id":"mh02","category":"跨文档多跳","query":"签订一份120万元的销售合同，由谁审批，扫描件存到哪个系统？","expect":{"all":[["分管副总"],["OA"]],"none":[]},"note":"contract 2.2（50-200万分管副总）+ contract 3.3（扫描件存 OA）"}
+{"id":"mh03","category":"跨文档多跳","query":"供应商准入由谁负责、哪些部门审核、资料存在哪个系统？","expect":{"all":[["采购部"],["质量管理部"],["SRM"]],"none":[]},"note":"procurement 3.1/3.2/3.3，三个要素都要"}
+{"id":"mh04","category":"跨文档多跳","query":"P1工单的响应时限是多久，在哪个系统派单，超时未解决升级给谁？","expect":{"all":[["2小时"],["ITSM"],["分管副总"]],"none":[]},"note":"service 1.1 + 2.2 + 3.2"}
+{"id":"mh05","category":"跨文档多跳","query":"员工请病假12天，需要哪个部门复核，请假在哪个系统提交？","expect":{"all":[["人力资源部"],["OA"]],"none":[]},"note":"attendance 3.3 + 5.1"}
+{"id":"mh06","category":"跨文档多跳","query":"供应商对账差异2000元，由谁复核，对账数据在哪个系统？","expect":{"all":[["财务部"],["SRM"]],"none":[]},"note":"procurement 5.2 + procurement 3.3（资料存 SRM）"}
+{"id":"mh07","category":"跨文档多跳","query":"框架合同到期前多久启动续签，合同用印由哪个部门负责？","expect":{"all":[["60天"],["行政部"]],"none":[]},"note":"contract 4.1 + 3.1"}
+{"id":"mh08","category":"跨文档多跳","query":"员工转岗后权限多久回收，转岗后还能看到合同条款吗？","expect":{"all":[["3个工作日"],["不能","不得","仅"]],"none":[]},"note":"permissions 4（转岗3个工作日回收）+ permissions 2/3（合同条款仅采购部与财务部）"}
+{"id":"mh09","category":"跨文档多跳","query":"销售部签下的合同，客户档案和合同条款分别哪些部门可以访问？","expect":{"all":[["销售部"],["财务部"]],"none":[]},"note":"permissions 3：客户档案=销售部+售后；合同条款=财务部（采购部只对供应商报价有权限，两题不能混）"}
+{"id":"mh10","category":"跨文档多跳","query":"供应商连续两次考核为C级会怎么处理，黑名单由谁维护？","expect":{"all":[["黑名单"],["两年"],["采购部"]],"none":[]},"note":"procurement 4.1 + 4.2 + 4.3"}

@@ -13,6 +13,10 @@ sentence-transformers>=2.2.0
 langgraph>=0.2.0
 numpy>=1.24.0
 tiktoken>=0.5.0
+rank-bm25>=0.2.2          # BM25 关键词召回（字符二元组切词，无需分词库）
+
+# ============ 真实文档解析（PDF）============
+pymupdf>=1.24.0           # PDF 文本 + 表格抽取（find_tables 用来把表格转成句子）
 
 # ============ 服务化（HTTP 接口）============
 fastapi>=0.110.0

@@ -1,0 +1,20 @@
+{"id":"v01","category":"单跳","query":"单笔采购3万元的设备，由谁审批？","expect":{"all":[["部门负责人"]],"none":[]},"note":"2.1条：低于5万"}
+{"id":"v02","category":"单跳","query":"单笔借款8000元，由谁审批？","expect":{"all":[["财务经理"]],"none":[]},"note":"4.2条：5000-2万"}
+{"id":"v03","category":"单跳","query":"国内出差预计花费3000元，由谁审批？","expect":{"all":[["部门负责人"]],"none":[]},"note":"5.1条：低于5000"}
+{"id":"v04","category":"多跳","query":"采购金额25万元，审批链上共有几个角色？","expect":{"all":[["部门负责人"],["财务总监"]],"none":[]},"note":"2.2条：5万-50万 → 两个角色"}
+{"id":"v05","category":"单跳","query":"采购20万元的合同需要法务部审核吗？","expect":{"all":[["需要","须经","应当"]],"none":[]},"note":"2.4条：10万以上"}
+{"id":"v06","category":"单跳","query":"同一采购事项可以拆分成多笔来规避审批吗？","expect":{"all":[["不得","不可以","禁止"]],"none":[]},"note":"6.4条"}
+{"id":"v07","category":"单跳","query":"超出审批权限的付款，财务部会怎么处理？","expect":{"all":[["拒绝"]],"none":[]},"note":"6.3条"}
+{"id":"v08","category":"单跳","query":"财务部下设哪几个组？","expect":{"all":[["会计组"],["资金组"]],"none":[]},"note":"org.md 第2节"}
+{"id":"v09","category":"多跳","query":"分管采购与生产的副总领导哪些总监？","expect":{"all":[["采购总监"],["生产总监"]],"none":[]},"note":"org.md 第3节"}
+{"id":"v10","category":"多跳","query":"信息技术部的负责人向谁汇报？","expect":{"all":[["总经理"]],"none":[]},"note":"org.md 第3节"}
+{"id":"v11","category":"单跳","query":"与供应商对账使用哪个系统？","expect":{"all":[["SRM"]],"none":[]},"note":"systems.md：SRM 用于供应商准入与对账"}
+{"id":"v12","category":"单跳","query":"客户档案存放在哪个系统？","expect":{"all":[["CRM"]],"none":[]},"note":"systems.md"}
+{"id":"v13","category":"单跳","query":"薪酬发放使用哪个系统？","expect":{"all":[["HRM"]],"none":[]},"note":"systems.md"}
+{"id":"v14","category":"单跳","query":"二级系统故障多长时间内响应？","expect":{"all":[["8小时","八小时"]],"none":[]},"note":"systems.md 第5节"}
+{"id":"v15","category":"单跳","query":"业务系统发生故障应该找哪个部门？","expect":{"all":[["信息技术部"]],"none":[]},"note":"systems.md 第5节"}
+{"id":"v16","category":"多跳","query":"秘密数据包括哪些内容？","expect":{"all":[["合同"],["供应商报价"],["客户档案"]],"none":[]},"note":"permissions.md 第1节：三项都要答到"}
+{"id":"v17","category":"单跳","query":"部门负责人可以访问哪个密级的数据？","expect":{"all":[["秘密"]],"none":[]},"note":"permissions.md 第2节：本部门秘密数据"}
+{"id":"v18","category":"多跳","query":"泄露机密数据会有什么后果？","expect":{"all":[["解除劳动合同","法律责任"]],"none":[]},"note":"permissions.md 第5节"}
+{"id":"v19","category":"单跳","query":"公司的主要客户有哪些？","expect":{"all":[["华东汽车"],["南方新能源"]],"none":[]},"note":"org.md 第5节"}
+{"id":"v20","category":"拒答","query":"公司有员工班车吗？","expect":{"all":[],"none":[]},"note":"知识库里没有班车规定，应拒答"}

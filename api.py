@@ -22,12 +22,15 @@ import os
 import sys
 import time
 import uuid
+from functools import partial
 from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
+
+from src.retriever.domain import parse_domains
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 # 保证能从项目根导入 src.*
@@ -88,6 +91,10 @@ class AskRequest(BaseModel):
         20.0, gt=0, le=60, description="单次请求超时（秒）"
     )
     include_trace: bool = Field(False, description="是否返回链路追踪树")
+    domain: Optional[str] = Field(
+        None,
+        description="业务域过滤，逗号分隔（如 pdf / simco / simco,project）；不传=全库",
+    )
 
 
 class AskResponse(BaseModel):
@@ -108,7 +115,9 @@ def init_orchestrator() -> None:
     """尝试初始化编排器。任何异常都被捕获，服务以 degraded 状态继续运行。"""
     try:
         from src.database.neo4j_client import Neo4jClient
-        from src.database.milvus_client import MilvusClient
+        # 向量库用本地实现：接口与 MilvusClient 完全一致，但不需要等 etcd/minio 容器。
+        # 变量名仍叫 milvus（下游有 20 多处引用），注释在这里说明它实际是什么。
+        from src.database.local_vector_store import LocalVectorStore
         from src.agents.orchestrator_v2 import AgentOrchestratorV2
 
         # 启动即校验配置（fail-fast：配置错了不要等第一个请求才炸）
@@ -120,7 +129,7 @@ def init_orchestrator() -> None:
             password=Config.NEO4J_PASSWORD,
         )
         neo4j.connect()
-        milvus = MilvusClient(host=Config.MILVUS_HOST, port=Config.MILVUS_PORT)
+        milvus = LocalVectorStore()
         milvus.connect()
         # 附加已存在的 collection（存在则复用，不重建）。
         # 为什么必需：MilvusClient 初始化后 self.collection 为 None，
@@ -306,7 +315,14 @@ async def ask(req: AskRequest, request: Request) -> AskResponse:
     loop = asyncio.get_running_loop()
     try:
         result = await asyncio.wait_for(
-            loop.run_in_executor(None, state.orchestrator.process, req.query),
+            loop.run_in_executor(
+                None,
+                partial(
+                    state.orchestrator.process,
+                    req.query,
+                    domains=parse_domains(req.domain),
+                ),
+            ),
             timeout=req.timeout_seconds,
         )
     except asyncio.TimeoutError:
@@ -412,7 +428,14 @@ async def ask_stream(req: AskRequest, request: Request) -> StreamingResponse:
         loop = asyncio.get_running_loop()
         try:
             result = await asyncio.wait_for(
-                loop.run_in_executor(None, state.orchestrator.process, req.query),
+                loop.run_in_executor(
+                None,
+                partial(
+                    state.orchestrator.process,
+                    req.query,
+                    domains=parse_domains(req.domain),
+                ),
+            ),
                 timeout=req.timeout_seconds,
             )
         except asyncio.TimeoutError:

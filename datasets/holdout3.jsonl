@@ -1,0 +1,20 @@
+{"id":"c01","category":"单跳","query":"单份销售合同金额120万元，由谁审批？","expect":{"all":[["分管副总"]],"none":[]},"note":"contract 2.2：50万-200万"}
+{"id":"c02","category":"单跳","query":"采购合同需要哪个部门审核？","expect":{"all":[["法务"]],"none":[]},"note":"contract 2.4"}
+{"id":"c03","category":"单跳","query":"合同签署后多久内必须归档？","expect":{"all":[["30个工作日","三十个工作日"]],"none":[]},"note":"contract 3.2"}
+{"id":"c04","category":"单跳","query":"框架合同到期前多久要启动续签？","expect":{"all":[["60天","六十天"]],"none":[]},"note":"contract 4.1"}
+{"id":"c05","category":"单跳","query":"合同违约金的上限是多少？","expect":{"all":[["10%"]],"none":[]},"note":"contract 5.2"}
+{"id":"s01","category":"单跳","query":"P1工单要求多长时间内响应？","expect":{"all":[["2小时","两小时"]],"none":[]},"note":"service 1.1"}
+{"id":"s02","category":"单跳","query":"P2工单要求多久内解决？","expect":{"all":[["3个工作日","三个工作日"]],"none":[]},"note":"service 4.2"}
+{"id":"s03","category":"单跳","query":"P1工单2小时内没有定位，升级给谁？","expect":{"all":[["售后服务部经理","售后经理"]],"none":[]},"note":"service 3.1"}
+{"id":"s04","category":"单跳","query":"售后工单在哪个系统里派单？","expect":{"all":[["ITSM"]],"none":[]},"note":"service 2.2"}
+{"id":"p01","category":"单跳","query":"采购金额10万元，需要几家供应商比价？","expect":{"all":[["三家","3家"]],"none":[]},"note":"procurement 2.2：5万-20万"}
+{"id":"p02","category":"单跳","query":"采购金额25万元，必须采用什么采购方式？","expect":{"all":[["招标"]],"none":[]},"note":"procurement 2.3：20万以上"}
+{"id":"p03","category":"单跳","query":"A级供应商的年度考核分数要求是多少？","expect":{"all":[["90"]],"none":[]},"note":"procurement 1.1"}
+{"id":"p04","category":"单跳","query":"供应商对账每月几号前完成？","expect":{"all":[["5日","5号"]],"none":[]},"note":"procurement 5.1"}
+{"id":"a01","category":"单跳","query":"司龄12年的员工，年假有几天？","expect":{"all":[["10天","十天"]],"none":[]},"note":"attendance 2.2：10-20年年假10天"}
+{"id":"a02","category":"单跳","query":"当年年假最晚什么时候休完？","expect":{"all":[["12月31日"]],"none":[]},"note":"attendance 2.4"}
+{"id":"a03","category":"单跳","query":"请病假5天需要提供什么材料？","expect":{"all":[["医院证明","证明"]],"none":[]},"note":"attendance 3.2：超过3天须证明"}
+{"id":"a04","category":"多跳","query":"请假连续8天，需要经过哪些人审批？","expect":{"all":[["分管副总"]],"none":[]},"note":"attendance 5.2：超过5天须分管副总"}
+{"id":"x01","category":"多跳","query":"采购一台30万元的设备，合同审核和付款审批分别找谁？","expect":{"all":[["法务"],["财务总监"]],"none":[]},"note":"contract 2.4 法务审核 + approval_matrix 2.2 财务总监"}
+{"id":"x02","category":"多跳","query":"连续两次考核为C级的供应商会有什么后果？","expect":{"all":[["黑名单"]],"none":[]},"note":"procurement 4.1"}
+{"id":"r01","category":"拒答","query":"公司有工会吗？","expect":{"all":[],"none":[]},"note":"所有文档都没有工会相关内容"}
